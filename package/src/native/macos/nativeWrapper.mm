@@ -29,6 +29,7 @@ static bool wgpuDebugEnabled() {
 #include "../shared/pending_resize_queue.h"
 #include "inspector_layout.h"
 #include "spell_check.h"
+#include "user_agent.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
 #include <mutex>
@@ -966,6 +967,7 @@ void releaseObjCObject(id objcObject) {
 - (void)toggleMirrorMode:(BOOL)enable;
 - (BOOL)shouldSuppressMirrorMode;
 - (BOOL)setSpellCheck:(BOOL)enabled;
+- (BOOL)setUserAgent:(NSString *)userAgent;
 
 - (BOOL)canGoBack;
 - (BOOL)canGoForward;
@@ -1086,6 +1088,7 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews =
 // ----------------------- Webview Implementations -----------------------
 @interface WKWebViewImpl : AbstractView
 @property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, copy) NSString *pendingUserAgent;
 
 - (void)loadURLOnMainThread:(NSString *)urlString;
 
@@ -1538,6 +1541,11 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 
 - (BOOL)setSpellCheck:(BOOL)enabled {
   (void)enabled;
+  return NO;
+}
+
+- (BOOL)setUserAgent:(NSString *)userAgent {
+  (void)userAgent;
   return NO;
 }
 
@@ -3052,6 +3060,10 @@ static void schedulePendingResizeDrain() {
       // create WKWebView
       self.webView = [[WKWebView alloc] initWithFrame:frame
                                         configuration:configuration];
+      if (self.pendingUserAgent) {
+        electrobun::setCustomUserAgent(self.webView, self.pendingUserAgent);
+        self.pendingUserAgent = nil;
+      }
 
       // Only set transparent background for main window webviews
       // (autoResize/fullscreen) Child webviews (OOPIFs) need a visible
@@ -3274,6 +3286,15 @@ static void schedulePendingResizeDrain() {
   if (navigationDelegate.hasFinishedNavigation) {
     return electrobun::setContinuousSpellChecking(self.webView, enabled);
   }
+  return YES;
+}
+
+- (BOOL)setUserAgent:(NSString *)userAgent {
+  if (!self.webView) {
+    self.pendingUserAgent = userAgent ?: @"";
+    return YES;
+  }
+  electrobun::setCustomUserAgent(self.webView, userAgent);
   return YES;
 }
 
@@ -8871,6 +8892,40 @@ extern "C" bool webviewSetSpellCheck(AbstractView *abstractView, bool enabled) {
   return runOnMainThreadSyncBool(^bool {
     return [abstractView setSpellCheck:enabled ? YES : NO] == YES;
   });
+}
+
+extern "C" bool webviewSetUserAgent(AbstractView *abstractView,
+                                    const char *userAgent) {
+  if (!abstractView) {
+    return false;
+  }
+  NSString *userAgentString =
+      userAgent ? [NSString stringWithUTF8String:userAgent] : nil;
+  return runOnMainThreadSyncBool(^bool {
+    return [abstractView setUserAgent:userAgentString] == YES;
+  });
+}
+
+// Returns a caller-owned copy, or NULL if WebKit didn't answer in time.
+extern "C" const char *getDefaultUserAgent() {
+  static NSString *cachedUserAgent = nil;
+  __block NSString *userAgent = nil;
+  waitForMainThreadAsyncCompletion(
+      5 * NSEC_PER_SEC, ^(dispatch_semaphore_t completionSemaphore) {
+        if (cachedUserAgent) {
+          userAgent = cachedUserAgent;
+          dispatch_semaphore_signal(completionSemaphore);
+          return;
+        }
+        __block WKWebView *probe = electrobun::createDefaultUserAgentProbe();
+        electrobun::readUserAgent(probe, ^(NSString *result) {
+          cachedUserAgent = result;
+          userAgent = result;
+          probe = nil;
+          dispatch_semaphore_signal(completionSemaphore);
+        });
+      });
+  return userAgent ? strdup(userAgent.UTF8String) : nullptr;
 }
 
 extern "C" void setWebviewNavigationRules(AbstractView *abstractView,

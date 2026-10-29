@@ -74,6 +74,10 @@ export type BrowserViewOptions<T = undefined> = {
 	// Enables macOS system spell checking for native WKWebView content.
 	// Unsupported renderers/platforms leave their behavior unchanged.
 	spellCheck: boolean;
+	// The User-Agent sent with every request, including the first, and reported
+	// as navigator.userAgent. Only the macOS native renderer supports it; other
+	// renderers/platforms log a warning and keep the engine default.
+	userAgent: string | null;
 	// renderer:
 };
 
@@ -138,6 +142,8 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	startTransparent: boolean = false;
 	startPassthrough: boolean = false;
 	spellCheck: boolean = false;
+	// The custom user agent in effect, or null for the engine default.
+	userAgent: string | null = null;
 	isRemoved: boolean = false;
 
 	get ptr(): Pointer | null {
@@ -176,9 +182,23 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.startTransparent = options.startTransparent ?? false;
 		this.startPassthrough = options.startPassthrough ?? false;
 		this.spellCheck = options.spellCheck ?? false;
+		this.userAgent = options.userAgent || null;
 
 		this.id = this.init() as number;
 		BrowserViewMap[this.id] = this;
+
+		if (this.userAgent) {
+			// The view was created without its URL, so the first request carries this user agent.
+			if (!this.setUserAgent(this.userAgent)) {
+				this.userAgent = null;
+				console.warn(
+					`BrowserView ${this.id}: userAgent is not supported by the ${this.renderer} renderer on ${process.platform}; using the engine default`,
+				);
+			}
+			if (this.url && !this.html) {
+				this.loadURL(this.url);
+			}
+		}
 
 		// If HTML content was provided, load it after webview creation.
 		if (this.html) {
@@ -198,8 +218,9 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			// todo: consider sending secretKey as base64
 			secretKey: this.secretKey.toString(),
 			partition: this.partition,
-			// Only pass URL if no HTML content is provided to avoid conflicts
-			url: this.html ? null : this.url,
+			// Only pass URL if no HTML content is provided to avoid conflicts.
+			// With a custom user agent the constructor loads the URL after setting it.
+			url: this.html || this.userAgent ? null : this.url,
 			preload: this.preload,
 			viewsRoot: this.viewsRoot,
 			allowedProtocols: this.allowedProtocols,
@@ -304,6 +325,32 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	setSpellCheck(enabled: boolean): boolean {
 		this.spellCheck = enabled;
 		return ffi.request.webviewSetSpellCheck({ id: this.id, enabled });
+	}
+
+	/**
+	 * Sets the User-Agent the view sends with its requests and reports as
+	 * navigator.userAgent, from its next request on. Pass null to go back to
+	 * the engine default. Returns false and changes nothing where the
+	 * renderer/platform does not support it: only the macOS native renderer does.
+	 */
+	setUserAgent(userAgent: string | null): boolean {
+		const applied = ffi.request.webviewSetUserAgent({
+			id: this.id,
+			userAgent: userAgent ?? "",
+		});
+		if (applied) {
+			this.userAgent = userAgent || null;
+		}
+		return applied;
+	}
+
+	/**
+	 * Returns the user agent the native renderer uses when no custom user agent
+	 * is set, as WebKit itself reports it. Returns null where it can't be read:
+	 * only macOS supports it.
+	 */
+	static getDefaultUserAgent(): string | null {
+		return ffi.request.getDefaultUserAgent();
 	}
 
 	findInPage(

@@ -5,3 +5,4 @@ patch/per-view-proxy cd package && node scripts/run-bun-test.js src/sdks/main/__
 patch/hard-reload-load-failed cd package && scripts/test-macos-webview-navigation.sh && node scripts/run-bun-test.js src/shared/webview-navigation-contract.test.ts src/shared/native-symbol-contract.test.ts src/sdks/main/proc/eventBridge.test.ts
 patch/webview-native-events node --test package/src/shared/native-requests.test.js && package/scripts/test-macos-native-requests.sh
 patch/storage-clear-completion cd package && node scripts/run-bun-test.js src/sdks/main/__tests__/session-storage.test.ts src/shared/native-symbol-contract.test.ts && scripts/test-macos-website-data-store.sh
+patch/isolated-preview-view cd package && node --test src/shared/isolated-preview.test.js && scripts/test-macos-isolated-preview.sh && node scripts/run-bun-test.js src/shared/native-symbol-contract.test.ts

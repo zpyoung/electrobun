@@ -1,0 +1,2720 @@
+// Run this script via terminal or command line with hutch build.ts
+
+import { $ } from "bun";
+import { spawnSync } from "child_process";
+import { createHash } from "crypto";
+import { platform, arch, tmpdir } from "os";
+import { basename, join } from "path";
+import {
+	existsSync,
+	readdirSync,
+	renameSync,
+	readFileSync,
+	writeFileSync,
+	mkdirSync,
+	chmodSync,
+	statSync,
+	unlinkSync,
+	cpSync,
+	rmSync,
+	mkdtempSync,
+} from "fs";
+import { parseArgs } from "util";
+import process from "process";
+import {
+	BUILD_DEPENDENCIES_PUBLIC_BASE_URL,
+	OWNED_BUILD_DEPENDENCY_VERSIONS,
+	ZIG_VERSION,
+	ownedBuildDependencyArtifact,
+	type BuildDependencyArch,
+	type OwnedBuildDependency,
+} from "./src/shared/build-dependencies";
+import {
+	CEF_VERSION,
+	CHROMIUM_VERSION,
+	DEFAULT_CEF_VERSION_STRING,
+} from "./src/shared/cef-version";
+import { RUST_VERSION } from "./src/shared/rust-version";
+import { GO_VERSION } from "./src/shared/go-version";
+import { ODIN_VERSION } from "./src/shared/odin-version";
+import { ELECTROBUN_VERSION } from "./src/shared/electrobun-version";
+import { resolveBuildArch, windowsBuildTarget } from "./src/shared/windows-build-target";
+import { goHostTuple, rustHostTriple, verifyGoToolchain, verifyRustToolchain } from "./src/shared/vendored-toolchain-host";
+import { assertWindowsBinaryArchitecture } from "./scripts/windows-binary-architecture.mjs";
+import { zigCompilerHostArchitecture } from "./scripts/zig-compiler-host.mjs";
+import {
+	NATIVE_DEVKIT_MANIFEST_FILENAME,
+	createNativeDevkitManifest,
+	nativeDevkitTarget,
+	serializeNativeDevkitManifest,
+} from "./src/shared/native-devkit-manifest";
+import {
+	MACOS_DEPLOYMENT_TARGET,
+	macosNativeArchitecture,
+	macosZigTarget,
+} from "./scripts/macos-release.js";
+import {
+	formatWindowsBatchCommand,
+	serializeNativeCompileFlags,
+	type NativeCompilePlatform,
+} from "./src/shared/native-compile-flags";
+
+console.log("building...", platform(), arch());
+
+const { values: args } = parseArgs({
+	args: Bun.argv,
+	options: {
+		release: {
+			type: "boolean",
+		},
+		ci: {
+			type: "boolean",
+		},
+		"core-only": {
+			type: "boolean",
+		},
+		"vendor-rust-only": {
+			type: "boolean",
+		},
+		"vendor-go-only": {
+			type: "boolean",
+		},
+		arch: { type: "string" },
+		npm: {
+			type: "boolean",
+		},
+	},
+	allowPositionals: true,
+});
+
+// TODO: set via cl arg
+const CHANNEL: "debug" | "release" = args.release ? "release" : "debug";
+const IS_NPM_BUILD = args.npm || false;
+const CORE_ONLY_BUILD = args["core-only"] || false;
+const OS: "win" | "linux" | "macos" = getPlatform();
+const ARCH: "arm64" | "x64" = getArch();
+const HOST_ARCH = resolveBuildArch(arch());
+const ZIG_HOST_ARCH = zigCompilerHostArchitecture();
+const WINDOWS_TARGET = windowsBuildTarget(ARCH);
+
+const isWindows = platform() === "win32";
+const binExt = OS === "win" ? ".exe" : "";
+const zigBinary = OS === "win" ? "zig.exe" : "zig";
+const rustBinary = OS === "win" ? "rustc.exe" : "rustc";
+const cargoBinary = OS === "win" ? "cargo.exe" : "cargo";
+const goBinary = OS === "win" ? "go.exe" : "go";
+const odinBinary = OS === "win" ? "odin.exe" : "odin";
+const macosClangTargetFlags = [
+	"-arch",
+	macosNativeArchitecture(ARCH),
+	`-mmacosx-version-min=${MACOS_DEPLOYMENT_TARGET}`,
+];
+// Note: We want all binaries in /dist to be extensionless to simplify our cross platform code
+// (no .exe on windows)
+
+// PATHS
+const PATH = {
+	zig: {
+		BIN: join(process.cwd(), "vendors", "zig", zigBinary),
+	},
+	rust: {
+		BIN: join(process.cwd(), "vendors", "rust", "bin", rustBinary),
+		CARGO: join(process.cwd(), "vendors", "rust", "bin", cargoBinary),
+	},
+	go: {
+		BIN: join(process.cwd(), "vendors", "go", "bin", goBinary),
+	},
+	odin: {
+		BIN: join(process.cwd(), "vendors", "odin", odinBinary),
+	},
+};
+
+// Minimum expected file sizes for downloaded archives (in bytes)
+// These are sanity checks to detect failed downloads (e.g., HTML error pages)
+const MIN_DOWNLOAD_SIZES: Record<string, number> = {
+	bun: 10 * 1024 * 1024, // Bun zip should be > 10MB
+	"zig-asar": 100 * 1024, // zig-asar tarball should be > 100KB
+	"zig-bsdiff": 100 * 1024, // zig-bsdiff tarball should be > 100KB
+	"zig-zstd": 100 * 1024, // zig-zstd tarball should be > 100KB
+	wgpu: 1 * 1024 * 1024, // Dawn (WGPU) tarball should be > 1MB
+	cef: 50 * 1024 * 1024, // CEF tarball should be > 50MB
+	rust: 100 * 1024 * 1024, // Rust toolchain tarball should be > 100MB
+	go: 50 * 1024 * 1024, // Go toolchain archive should be > 50MB
+	odin: 30 * 1024 * 1024, // Odin toolchain archive should be > 30MB
+};
+
+function validateDownload(filePath: string, type: string): void {
+	if (!existsSync(filePath)) {
+		throw new Error(`Download failed: ${filePath} does not exist`);
+	}
+	const stats = statSync(filePath);
+	const minSize = MIN_DOWNLOAD_SIZES[type];
+	if (minSize && stats.size < minSize) {
+		// Remove the invalid file so next run will re-download
+		unlinkSync(filePath);
+		throw new Error(
+			`Download failed: ${filePath} is only ${stats.size} bytes (expected > ${minSize} bytes). ` +
+				`Please try again in a minute.`,
+		);
+	}
+}
+
+async function downloadOwnedBuildDependency(
+	product: OwnedBuildDependency,
+	targetArch: BuildDependencyArch,
+	destination: string,
+	validationType: string,
+): Promise<void> {
+	const publicBaseUrl =
+		process.env["ELECTROBUN_BUILD_DEPENDENCIES_BASE_URL"] ??
+		BUILD_DEPENDENCIES_PUBLIC_BASE_URL;
+	const artifact = ownedBuildDependencyArtifact(
+		product,
+		OS,
+		targetArch,
+		publicBaseUrl,
+	);
+	const checksumPath = `${destination}.sha256`;
+
+	rmSync(destination, { force: true });
+	rmSync(checksumPath, { force: true });
+	console.log(`Downloading ${product} ${artifact.version} from ${artifact.url}`);
+
+	try {
+		await $`curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 ${artifact.checksumUrl} -o ${checksumPath}`;
+		await $`curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 ${artifact.url} -o ${destination}`;
+		validateDownload(destination, validationType);
+
+		const expected = readFileSync(checksumPath, "utf8")
+			.trim()
+			.split(/\s+/, 1)[0]
+			?.toLowerCase();
+		if (!expected || !/^[a-f0-9]{64}$/.test(expected)) {
+			throw new Error(`Invalid checksum file returned for ${artifact.filename}`);
+		}
+		const actual = createHash("sha256")
+			.update(readFileSync(destination))
+			.digest("hex");
+		if (actual !== expected) {
+			rmSync(destination, { force: true });
+			throw new Error(
+				`Checksum mismatch for ${artifact.filename}: expected ${expected}, got ${actual}`,
+			);
+		}
+	} finally {
+		rmSync(checksumPath, { force: true });
+	}
+}
+
+function outputMissingOrOlder(outputPath: string, inputPaths: string[]): boolean {
+	if (!existsSync(outputPath)) {
+		return true;
+	}
+
+	const outputMtime = statSync(outputPath).mtimeMs;
+	return inputPaths.some((inputPath) => {
+		if (!existsSync(inputPath)) {
+			return false;
+		}
+		return statSync(inputPath).mtimeMs > outputMtime;
+	});
+}
+
+// TODO: setup file watchers
+try {
+	if (args["vendor-rust-only"] || args["vendor-go-only"]) {
+		// Core release archives deliberately omit SDK compilers. Allow native
+		// regression gates to provision this exact toolchain without building
+		// Electrobun again or downloading the other SDK toolchains.
+		if (args["vendor-rust-only"]) {
+			console.log(`Preparing pinned Rust ${RUST_VERSION} only...`);
+			await vendorRust();
+		}
+		if (args["vendor-go-only"]) {
+			console.log(`Preparing pinned Go ${GO_VERSION} only...`);
+			await vendorGo();
+		}
+	} else if (IS_NPM_BUILD) {
+		console.log("Building for npm (JS/TS files only)...");
+		await buildForNpm();
+	} else {
+		await setup();
+		await build();
+		await copyToDist();
+	}
+} catch (err) {
+	console.error(err);
+	process.exit(1);
+}
+
+// Global variables to store build tool paths
+var CMAKE_BIN = "cmake";
+
+async function vendorCmake() {
+	if (OS !== "macos") return;
+
+	// On macOS, cmake is distributed as an app bundle
+	const vendoredCmakePath = join(
+		process.cwd(),
+		"vendors",
+		"cmake",
+		"CMake.app",
+		"Contents",
+		"bin",
+		"cmake",
+	);
+
+	// Check if cmake is already available (system or vendored)
+	try {
+		await $`which cmake`.quiet();
+		console.log("✓ cmake found in system PATH");
+		CMAKE_BIN = "cmake";
+		return;
+	} catch {
+		// Not in system PATH, check if vendored
+		if (existsSync(vendoredCmakePath)) {
+			CMAKE_BIN = vendoredCmakePath;
+			console.log("✓ Using vendored cmake");
+			return;
+		}
+	}
+
+	console.log("cmake not found, downloading...");
+
+	try {
+		const cmakeVersion = "3.30.2";
+		const cmakeUrl = `https://github.com/Kitware/CMake/releases/download/v${cmakeVersion}/cmake-${cmakeVersion}-macos-universal.tar.gz`;
+
+		await $`mkdir -p vendors`;
+		console.log(`Downloading cmake ${cmakeVersion} for macOS...`);
+
+		// Download and extract in vendors directory
+		const tempFile = "vendors/cmake_temp.tar.gz";
+		await $`curl -L "${cmakeUrl}" -o "${tempFile}"`;
+
+		// Extract in vendors directory
+		await $`cd vendors && tar -xzf cmake_temp.tar.gz`;
+
+		// Always clean up the temp file
+		await $`rm -f vendors/cmake_temp.tar.gz`;
+
+		// Rename to simple 'cmake' directory if needed
+		const extractedDir = `vendors/cmake-${cmakeVersion}-macos-universal`;
+		if (existsSync(extractedDir)) {
+			await $`rm -rf vendors/cmake`; // Remove old cmake if exists
+			await $`mv "${extractedDir}" vendors/cmake`;
+		}
+
+		// Set the cmake binary path
+		CMAKE_BIN = vendoredCmakePath;
+
+		// Verify it works
+		await $`"${CMAKE_BIN}" --version`;
+		console.log("✓ cmake vendored successfully");
+	} catch (error) {
+		console.error("Failed to vendor cmake:", error);
+		throw new Error("Could not vendor cmake. Please install it manually.");
+	}
+}
+
+// Global variable to store vcvarsall path
+var VCVARSALL_PATH = "";
+
+function formatExitStatus(status: number | null) {
+	const value = status ?? 1;
+	return OS === "win"
+		? `0x${(value >>> 0).toString(16).padStart(8, "0").toUpperCase()}`
+		: String(value);
+}
+
+function runCaptured(command: string, args: string[]) {
+	const result = spawnSync(command, args, {
+		encoding: "utf8",
+		stdio: "pipe",
+	});
+	if (result.error) throw result.error;
+	if (result.status !== 0) {
+		throw new Error(
+			[
+				`${[command, ...args].map((value) => JSON.stringify(value)).join(" ")} failed with ${result.signal ? `signal ${result.signal}` : `exit status ${formatExitStatus(result.status)}`}`,
+				`cwd: ${process.cwd()}`,
+				String(result.stderr || "").trim(),
+				String(result.stdout || "").trim(),
+			]
+				.filter(Boolean)
+				.join("\n"),
+		);
+	}
+	return String(result.stdout || "");
+}
+
+function runInherited(command: string, args: string[], cwd = process.cwd()) {
+	const result = spawnSync(command, args, {
+		cwd,
+		stdio: "inherit",
+	});
+	if (result.error) throw result.error;
+	if (result.status !== 0) {
+		throw new Error(
+			`${[command, ...args].map((value) => JSON.stringify(value)).join(" ")} failed with ${result.signal ? `signal ${result.signal}` : `exit status ${formatExitStatus(result.status)}`}\n` +
+				`cwd: ${cwd}`,
+		);
+	}
+}
+
+async function runZigBuild(
+	projectDir: string,
+	zigArgs: string[],
+	releaseOptimize: "ReleaseFast" | "ReleaseSmall" = "ReleaseSmall",
+) {
+	const optimizeArgs =
+		CHANNEL === "release" ? [`-Doptimize=${releaseOptimize}`] : [];
+	if (OS === "win") {
+		runInherited(
+			PATH.zig.BIN,
+			["build", ...optimizeArgs, ...zigArgs],
+			join(process.cwd(), "src", projectDir),
+		);
+		return;
+	}
+
+	const projectPath = join("src", projectDir);
+	if (CHANNEL === "release") {
+		await $`cd ${projectPath} && ../../vendors/zig/zig build ${optimizeArgs} ${zigArgs}`;
+	} else {
+		await $`cd ${projectPath} && ../../vendors/zig/zig build ${zigArgs}`;
+	}
+}
+
+function findWindowsExecutable(name: string) {
+	try {
+		return runCaptured("where.exe", [name]).split(/\r?\n/, 1)[0]?.trim() || "";
+	} catch {
+		return "";
+	}
+}
+
+function findVisualStudioInstallation() {
+	const vswherePath = join(
+		process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+		"Microsoft Visual Studio",
+		"Installer",
+		"vswhere.exe",
+	);
+	const command = existsSync(vswherePath) ? vswherePath : "vswhere.exe";
+	const result = spawnSync(
+		command,
+		[
+			"-latest",
+			"-products",
+			"*",
+			"-requires",
+			WINDOWS_TARGET.vcComponent,
+			"-property",
+			"installationPath",
+		],
+		{ encoding: "utf8", stdio: "pipe" },
+	);
+	if (result.error || result.status !== 0) return "";
+	return String(result.stdout || "").trim();
+}
+
+async function findMsvcTools() {
+	if (OS !== "win") return;
+
+	try {
+		const vsInstallPath = findVisualStudioInstallation();
+		if (!vsInstallPath) {
+			console.log("Could not find Visual Studio installation path");
+			return;
+		}
+
+		VCVARSALL_PATH = join(
+			vsInstallPath,
+			"VC",
+			"Auxiliary",
+			"Build",
+			"vcvarsall.bat",
+		);
+
+		if (!existsSync(VCVARSALL_PATH)) {
+			console.log("vcvarsall.bat not found at expected location");
+			VCVARSALL_PATH = "";
+			return;
+		}
+
+		console.log("✓ Found MSVC tools with vcvarsall.bat");
+	} catch {
+		console.log("Could not locate MSVC tools, using default tool names");
+	}
+}
+
+// Helper function to run MSVC commands with environment set up
+async function runMsvcCommand(command: string) {
+	const comSpec =
+		process.env["ComSpec"] ??
+		join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "cmd.exe");
+	// Keep commands containing quoted paths inside the batch file. Passing such
+	// commands through cmd.exe's argv quoting breaks checkouts whose path has spaces.
+	const commandCwd = process.cwd();
+	const tempDir = mkdtempSync(join(tmpdir(), "electrobun-msvc-"));
+	const tempBat = join(tempDir, "build.cmd");
+	const batContent = [
+		"@echo off",
+		VCVARSALL_PATH ? `call "${VCVARSALL_PATH}" ${WINDOWS_TARGET.vcvars} >nul` : null,
+		"if errorlevel 1 exit /b %errorlevel%",
+		`cd /D "${commandCwd}"`,
+		command,
+	]
+		.filter(Boolean)
+		.join("\n");
+
+	writeFileSync(tempBat, batContent);
+
+	try {
+		runInherited(comSpec, ["/D", "/S", "/C", ".\\build.cmd"], tempDir);
+	} finally {
+		// Windows can retain the child process' working-directory handle for a
+		// short interval after cmd.exe exits. Retry so that transient FileBusy
+		// errors do not turn an otherwise successful native build into a failure.
+		let cleanupError: unknown;
+		for (let attempt = 0; attempt < 10; attempt += 1) {
+			try {
+				rmSync(tempDir, { recursive: true, force: true });
+				cleanupError = undefined;
+				break;
+			} catch (error) {
+				cleanupError = error;
+				await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+			}
+		}
+		if (cleanupError) throw cleanupError;
+	}
+}
+
+function getWindowsCmakeGenerator() {
+	// Prefer a toolchain-driven generator over the Visual Studio IDE generator.
+	// On CI we may have MSVC Build Tools + vcvarsall without a full VS instance
+	// that CMake can discover for `-G "Visual Studio 17 2022"`.
+	return VCVARSALL_PATH ? "NMake Makefiles" : "Visual Studio 17 2022";
+}
+
+function getWindowsCefWrapperLibPath() {
+	const candidates = [
+		join(
+			process.cwd(),
+			"vendors",
+			"cef",
+			"build",
+			"libcef_dll_wrapper",
+			"Release",
+			"libcef_dll_wrapper.lib",
+		),
+		join(
+			process.cwd(),
+			"vendors",
+			"cef",
+			"build",
+			"libcef_dll_wrapper",
+			"libcef_dll_wrapper.lib",
+		),
+	];
+
+	return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
+}
+
+async function installWindowsDeps() {
+	const scriptPath = join(process.cwd(), "scripts", "install-windows-deps.ps1");
+	if (!existsSync(scriptPath)) {
+		console.error(`Installer script not found: ${scriptPath}`);
+		throw new Error(
+			"Windows installer script missing. Please run the installer manually.",
+		);
+	}
+
+	console.log(
+		"Running Windows dependency installer (may require Administrator privileges)...",
+	);
+	try {
+		// Run the PowerShell helper (it will request elevation if needed)
+		await $`powershell -ExecutionPolicy Bypass -NoProfile -File "${scriptPath}"`;
+		console.log(
+			"Windows dependency installer finished. Re-checking dependencies...",
+		);
+	} catch (err) {
+		console.error("Windows installer failed:", err);
+		throw err;
+	}
+}
+
+async function checkDependencies() {
+	const missingDeps: string[] = [];
+
+	if (OS === "macos") {
+		// Try to vendor cmake if not available
+		await vendorCmake();
+
+		// Check for make (should be available with Xcode command line tools)
+		try {
+			await $`which make`.quiet();
+		} catch {
+			missingDeps.push(
+				"make (install Xcode Command Line Tools: xcode-select --install)",
+			);
+		}
+	} else if (OS === "win") {
+		// Find MSVC compiler tools
+		await findMsvcTools();
+
+		// Check for cmake without relying on shell parsing.
+		const cmakePath = findWindowsExecutable("cmake");
+		if (cmakePath) {
+			CMAKE_BIN = cmakePath;
+		} else {
+			missingDeps.push("cmake");
+		}
+
+		if (!findVisualStudioInstallation()) missingDeps.push("visual-studio");
+
+		if (missingDeps.length > 0) {
+			// In CI we should not attempt interactive installs
+			if (process.env["GITHUB_ACTIONS"]) {
+				console.warn(
+					"\n⚠️  Missing required dependencies in CI - continuing (CI should provide these)",
+				);
+			} else {
+				try {
+					await installWindowsDeps();
+				} catch {
+					console.error("Auto-install failed or was cancelled.");
+				}
+
+				// Re-check cmake
+				const newMissing: string[] = [];
+				const installedCmakePath = findWindowsExecutable("cmake");
+				if (installedCmakePath) {
+					CMAKE_BIN = installedCmakePath;
+				} else {
+					newMissing.push("cmake");
+				}
+
+				// Re-check Visual Studio
+				if (!findVisualStudioInstallation()) {
+					newMissing.push("visual-studio");
+				}
+
+				if (newMissing.length > 0) {
+					missingDeps.length = 0;
+					newMissing.forEach((m) => missingDeps.push(m));
+				} else {
+					// clear missingDeps if everything is present now
+					missingDeps.length = 0;
+				}
+			}
+		}
+	} else if (OS === "linux") {
+		// Check for build essentials
+		try {
+			await $`which cmake`.quiet();
+			CMAKE_BIN = "cmake";
+		} catch {
+			missingDeps.push("cmake");
+		}
+		try {
+			await $`which make`.quiet();
+		} catch {
+			missingDeps.push("make");
+		}
+		try {
+			await $`which gcc`.quiet();
+		} catch {
+			missingDeps.push("build-essential");
+		}
+	}
+
+	if (missingDeps.length > 0) {
+		console.error("\n⚠️  Missing required dependencies:");
+		missingDeps.forEach((dep) => console.error(`  • ${dep}`));
+
+		if (OS === "macos") {
+			console.error("\nTo install missing dependencies on macOS:");
+			console.error("• For make: Install Xcode Command Line Tools");
+			console.error("   xcode-select --install");
+		} else if (OS === "win") {
+			console.error("\nTo install missing dependencies on Windows:");
+			console.error("1. Install Visual Studio 2022 with C++ development tools");
+			console.error("2. Install cmake from: https://cmake.org/download/");
+		} else if (OS === "linux") {
+			console.error("\nTo install missing dependencies on Linux:");
+			console.error(
+				"   sudo apt update && sudo apt install -y build-essential cmake",
+			);
+		}
+
+		// In CI, just warn but continue; locally throw an error
+		if (process.env["GITHUB_ACTIONS"]) {
+			console.warn(
+				"\n⚠️  Running in CI - continuing despite missing dependencies",
+			);
+			console.warn(
+				"   The CI workflow should have already installed these dependencies",
+			);
+		} else {
+			throw new Error(
+				"Missing required dependencies. Please install them and try again.",
+			);
+		}
+	}
+
+	console.log("✓ All required dependencies found");
+}
+
+async function setup() {
+	await checkDependencies();
+	rmSync(join(process.cwd(), "vendors", "hutch"), {
+		recursive: true,
+		force: true,
+	});
+	rmSync(join(process.cwd(), "vendors", "cottontail"), {
+		recursive: true,
+		force: true,
+	});
+	await Promise.all([
+		vendorBsdiff(),
+		vendorZstd(),
+		vendorAsar(),
+		vendorWGPU(),
+	]);
+	await vendorZig(); // ziglang.org (not GitHub)
+	if (!CORE_ONLY_BUILD) {
+		await vendorRust(); // static.rust-lang.org
+		await vendorGo(); // go.dev
+		if (!(OS === "win" && ARCH === "arm64")) await vendorOdin(); // No Windows ARM64 Odin toolchain.
+	}
+	await vendorCEF(); // Spotify CDN (not GitHub)
+	await vendorWebview2();
+	await vendorLinuxDeps();
+}
+
+async function build() {
+	await createDistFolder();
+	await installPackageDependencies();
+
+	// await buildAsar(); // Now using vendored binaries from zig-asar releases
+	await buildNative(); // zig depends on this for linking symbols
+
+	// Build preload script (compiles TypeScript to JS for webview injection)
+	console.log("Building preload script...");
+	await buildPreload();
+
+	await Promise.all([
+		buildSelfExtractor(),
+		buildCore(),
+		buildLauncher(),
+		buildMainJs(),
+	]);
+}
+
+async function buildForNpm() {
+	console.log("Creating dist folder for npm...");
+	await createDistFolder();
+
+	console.log("Building main.js...");
+	await buildMainJs();
+
+	// Build preload script (compiles TypeScript to JS for webview injection)
+	// Must run before copyApiFiles so the generated file is included
+	console.log("Building preload script...");
+	await buildPreload();
+
+	console.log("Copying API files...");
+	await copyApiFiles();
+
+	console.log(
+		"npm build complete! dist/ contains main.js and api/ folder (main, browser, shared APIs).",
+	);
+}
+
+async function copyApiFiles() {
+	// Copy TypeScript APIs while preserving source-relative imports.
+	// Use Node's copy implementation here so directory-root semantics stay the
+	// same across Windows and Unix shells.
+	mkdirSync("dist/api/sdks", { recursive: true });
+	cpSync("src/sdks/main", "dist/api/sdks/main", { recursive: true, force: true });
+	cpSync("src/browser", "dist/api/browser", { recursive: true, force: true });
+	cpSync("src/shared", "dist/api/shared", { recursive: true, force: true });
+	cpSync("src/config", "dist/api/config", { recursive: true, force: true });
+	cpSync("src/preload", "dist/api/preload", { recursive: true, force: true });
+
+	mkdirSync("dist/zig-sdk", { recursive: true });
+	cpSync("src/sdks/zig/electrobun.zig", "dist/zig-sdk/electrobun.zig", {
+		force: true,
+	});
+	mkdirSync("dist/rust-sdk", { recursive: true });
+	cpSync("src/sdks/rust/electrobun.rs", "dist/rust-sdk/electrobun.rs", {
+		force: true,
+	});
+	cpSync("src/sdks/rust/Cargo.toml", "dist/rust-sdk/Cargo.toml", {
+		force: true,
+	});
+	mkdirSync("dist/go-sdk", { recursive: true });
+	cpSync("src/sdks/go", "dist/go-sdk", { recursive: true, force: true });
+
+	// Odin SDK is a package directory; the CLI exposes its parent as an Odin
+	// collection so user code can `import "electrobun_sdk:electrobun"`.
+	rmSync("dist/odin-sdk/electrobun", { recursive: true, force: true });
+	mkdirSync("dist/odin-sdk/electrobun", { recursive: true });
+	cpSync("src/sdks/odin/electrobun.odin", "dist/odin-sdk/electrobun/electrobun.odin", {
+		force: true,
+	});
+}
+
+function copyMatchingFiles(
+	sourceDir: string,
+	destinationDir: string,
+	matches: (filename: string) => boolean,
+) {
+	if (!existsSync(sourceDir)) return;
+	mkdirSync(destinationDir, { recursive: true });
+	for (const filename of readdirSync(sourceDir)) {
+		const source = join(sourceDir, filename);
+		if (matches(filename) && statSync(source).isFile()) {
+			cpSync(source, join(destinationDir, filename), { force: true });
+		}
+	}
+}
+
+async function copyToDist() {
+	// Bun is not distributed here: Hutch vendors it as a toolchain and stages
+	// it into app bundles for mainProcess "bun"; the devkit only pins the
+	// default version.
+	// Zig launcher for all platforms
+	cpSync(`src/launcher/zig-out/bin/launcher${binExt}`, `dist/launcher${binExt}`, { force: true });
+	cpSync(`src/extractor/zig-out/bin/extractor${binExt}`, `dist/extractor${binExt}`, { force: true });
+	const coreLibName =
+		OS === "win"
+			? "ElectrobunCore.dll"
+			: OS === "macos"
+				? "libElectrobunCore.dylib"
+				: "libElectrobunCore.so";
+	const coreLibSourceDir = OS === "win" ? "bin" : "lib";
+	cpSync(join("src", "core", "zig-out", coreLibSourceDir, coreLibName), join("dist", coreLibName), { force: true });
+	// Copy bsdiff/bspatch from vendored zig-bsdiff
+	cpSync(`vendors/zig-bsdiff/bsdiff${binExt}`, `dist/bsdiff${binExt}`, { force: true });
+	cpSync(`vendors/zig-bsdiff/bspatch${binExt}`, `dist/bspatch${binExt}`, { force: true });
+	// Copy zig-zstd from vendored zig-zstd
+	cpSync(`vendors/zig-zstd/zig-zstd${binExt}`, `dist/zig-zstd${binExt}`, { force: true });
+
+	// Copy zig-asar CLI and library from vendored zig-asar
+	const libExt = OS === "win" ? ".dll" : OS === "macos" ? ".dylib" : ".so";
+
+	// Copy electrobun-dawn (WGPU) shared library only
+	const wgpuSourceDir = join(process.cwd(), "vendors", "wgpu", `${OS}-${ARCH}`);
+	if (existsSync(wgpuSourceDir)) {
+		const wgpuLibCandidates =
+			OS === "win"
+				? [
+						join(wgpuSourceDir, "bin", "webgpu_dawn.dll"),
+						join(wgpuSourceDir, "bin", "libwebgpu_dawn.dll"),
+						join(wgpuSourceDir, "lib", "webgpu_dawn.dll"),
+						join(wgpuSourceDir, "lib", "libwebgpu_dawn.dll"),
+					]
+				: [
+						join(wgpuSourceDir, "lib", `libwebgpu_dawn${libExt}`),
+						join(wgpuSourceDir, "lib", `libwebgpu_dawn_shared${libExt}`),
+					];
+
+		const wgpuLib = wgpuLibCandidates.find((p) => existsSync(p));
+		if (!wgpuLib) {
+			throw new Error(`WGPU shared library not found in ${wgpuSourceDir}`);
+		}
+		cpSync(wgpuLib, join("dist", basename(wgpuLib)), { force: true });
+		console.log("✓ Copied WGPU shared library to dist");
+
+		// On Windows, Dawn needs d3dcompiler_47.dll for D3D shader compilation.
+		// ARM64 Windows doesn't have an x64 version in system directories,
+		// so we must bundle it alongside the WGPU library.
+		if (OS === "win") {
+			const d3dCompilerCandidates = [
+				join(wgpuSourceDir, "bin", "d3dcompiler_47.dll"),
+				join(process.cwd(), "vendors", "cef", "Release", "d3dcompiler_47.dll"),
+			];
+			const d3dCompiler = d3dCompilerCandidates.find((p) => existsSync(p));
+			if (d3dCompiler) {
+				cpSync(d3dCompiler, join("dist", "d3dcompiler_47.dll"), { force: true });
+				console.log("✓ Copied d3dcompiler_47.dll to dist");
+			}
+		}
+	}
+
+	if (OS === "win") {
+		mkdirSync(join("dist", "zig-asar", ARCH), { recursive: true });
+		cpSync(`vendors/zig-asar/${ARCH}/zig-asar.exe`, `dist/zig-asar/${ARCH}/zig-asar.exe`, { force: true });
+		cpSync(`vendors/zig-asar/${ARCH}/libasar.dll`, `dist/zig-asar/${ARCH}/libasar.dll`, { force: true });
+		cpSync(`vendors/zig-asar/${ARCH}/libasar.dll`, "dist/libasar.dll", { force: true });
+		console.log(`✓ Copied ${ARCH} zig-asar to dist`);
+	} else {
+		// Unix: single architecture
+		await $`cp vendors/zig-asar/zig-asar${binExt} dist/zig-asar${binExt}`;
+		const asarLibPath = `vendors/zig-asar/libasar${libExt}`;
+		if (existsSync(asarLibPath)) {
+			await $`cp ${asarLibPath} dist/libasar${libExt}`;
+		} else {
+			throw new Error(`Required library file not found: ${asarLibPath}`);
+		}
+	}
+
+	// Verify critical files were copied
+	if (OS === "macos") {
+		const launcherPath = join("dist", `launcher${binExt}`);
+		if (!existsSync(launcherPath)) {
+			throw new Error(`launcher${binExt} was not copied to ${launcherPath}`);
+		}
+		console.log(`launcher${binExt} copied successfully to ${launcherPath}`);
+	}
+		mkdirSync("bin", { recursive: true });
+	for (const unbundledRuntime of [
+		"hutch",
+		"hutch.exe",
+		"hutch-engine",
+		"hutch-engine.exe",
+		"cottontail",
+		"cottontail.exe",
+		".runtime-platform",
+	]) {
+		rmSync(join("bin", unbundledRuntime), { force: true });
+	}
+	rmSync(join("bin", OS === "win" ? "electrobun.exe" : "electrobun"), { force: true });
+	// Electrobun's Typescript bun and browser apis
+	await copyApiFiles();
+	// Native code and frameworks
+	if (OS === "macos") {
+		await $`cp -R src/native/build/libNativeWrapper.dylib dist/libNativeWrapper.dylib`;
+		// Copy CEF to cef/ subdirectory for consistent organization
+		await $`mkdir -p dist/cef`;
+		cpSync(
+			join(
+				"vendors",
+				"cef",
+				"Release",
+				"Chromium Embedded Framework.framework",
+			),
+			join("dist", "cef", "Chromium Embedded Framework.framework"),
+			{ recursive: true, force: true, preserveTimestamps: true },
+		);
+		// CEF's helper process binary
+		cpSync(
+			join("src", "native", "build", "process_helper"),
+			join("dist", "process_helper"),
+		);
+	} else if (OS === "win") {
+		cpSync("src/native/win/build/libNativeWrapper.dll", "dist/libNativeWrapper.dll", { force: true });
+		const webview2Arch = WINDOWS_TARGET.webview2;
+		cpSync(
+			join("vendors", "webview2", "Microsoft.Web.WebView2", "build", "native", webview2Arch, "WebView2Loader.dll"),
+			join("dist", "WebView2Loader.dll"),
+			{ force: true },
+		);
+		// CEF binaries for Windows - copy ALL CEF files to cef/ subdirectory for consistent organization
+		const cefDistDir = join("dist", "cef");
+		const cefReleaseDir = join("vendors", "cef", "Release");
+		const cefResourcesDir = join("vendors", "cef", "Resources");
+		mkdirSync(cefDistDir, { recursive: true });
+		copyMatchingFiles(cefReleaseDir, cefDistDir, (filename) =>
+			/[.](?:dll|pak|dat|bin|json)$/i.test(filename),
+		);
+
+		console.log("Copying CEF resource files...");
+		copyMatchingFiles(cefResourcesDir, cefDistDir, (filename) =>
+			/[.](?:pak|dat)$/i.test(filename),
+		);
+		const cefLocalesDir = join(cefResourcesDir, "locales");
+		if (existsSync(cefLocalesDir)) {
+			cpSync(cefLocalesDir, join(cefDistDir, "Resources", "locales"), {
+				recursive: true,
+				force: true,
+			});
+		}
+
+		// Copy CEF helper process
+		cpSync("src/native/build/process_helper.exe", "dist/process_helper.exe", { force: true });
+	} else if (OS === "linux") {
+		// Copy both GTK-only and CEF native wrappers for flexible deployment
+		if (
+			existsSync(
+				join(process.cwd(), "src", "native", "build", "libNativeWrapper.so"),
+			)
+		) {
+			await $`cp src/native/build/libNativeWrapper.so dist/libNativeWrapper.so`;
+		}
+		if (
+			existsSync(
+				join(
+					process.cwd(),
+					"src",
+					"native",
+					"build",
+					"libNativeWrapper_cef.so",
+				),
+			)
+		) {
+			await $`cp src/native/build/libNativeWrapper_cef.so dist/libNativeWrapper_cef.so`;
+		}
+
+		// CEF binaries for Linux - copy to cef/ subdirectory
+		if (existsSync(join(process.cwd(), "vendors", "cef", "Release"))) {
+			console.log("Copying CEF files for Linux...");
+			await $`mkdir -p dist/cef`;
+
+			// Copy main CEF library and dependencies
+			await $`cp vendors/cef/Release/*.so dist/cef/`;
+			await $`cp vendors/cef/Release/*.so.* dist/cef/`; // For versioned libraries like libvulkan.so.1
+			await $`cp vendors/cef/Release/*.bin dist/cef/`;
+			await $`cp vendors/cef/Release/*.json dist/cef/`; // For vk_swiftshader_icd.json
+
+			// Strip debug symbols from CEF libraries to reduce file size
+			console.log("Stripping debug symbols from CEF libraries...");
+			await $`strip --strip-debug dist/cef/*.so dist/cef/*.so.* 2>/dev/null || true`;
+
+			// Copy stripped CEF files to platform-specific directory
+			const platformCefDir = `dist-${OS}-${ARCH}/cef`;
+			await $`mkdir -p ${platformCefDir}`;
+			await $`cp -r dist/cef/* ${platformCefDir}/`;
+			console.log(`Copied stripped CEF files to ${platformCefDir}`);
+
+			// Copy chrome-sandbox (needs setuid root)
+			if (
+				existsSync(
+					join(process.cwd(), "vendors", "cef", "Release", "chrome-sandbox"),
+				)
+			) {
+				await $`cp vendors/cef/Release/chrome-sandbox dist/cef/`;
+			}
+
+			// Copy Resources
+			await $`cp vendors/cef/Resources/*.pak dist/cef/`;
+			await $`cp vendors/cef/Resources/*.dat dist/cef/`;
+
+			// Copy locales
+			await $`mkdir -p dist/cef/locales`;
+			await $`cp vendors/cef/Resources/locales/*.pak dist/cef/locales/`;
+		} else {
+			console.log("CEF not built, skipping CEF file copying");
+		}
+
+		// Copy CEF helper process if it exists
+		if (
+			existsSync(
+				join(process.cwd(), "src", "native", "build", "process_helper"),
+			)
+		) {
+			await $`cp src/native/build/process_helper dist/process_helper`;
+		}
+		console.log("[done]Copying CEF files for Linux...");
+	}
+
+	const nativeDevkitManifest = createNativeDevkitManifest({
+		productVersion: ELECTROBUN_VERSION,
+		target: nativeDevkitTarget(OS, ARCH),
+	});
+	writeFileSync(
+		join("dist", NATIVE_DEVKIT_MANIFEST_FILENAME),
+		serializeNativeDevkitManifest(nativeDevkitManifest),
+	);
+
+	normalizeDistExecutableModes("dist");
+	// Create platform-specific dist folder and copy all files
+	await createPlatformDistFolder();
+}
+
+function normalizeDistExecutableModes(directory: string) {
+	if (OS === "win") return;
+	for (const filename of [
+		"launcher",
+		"extractor",
+		"bsdiff",
+		"bspatch",
+		"zig-asar",
+		"zig-zstd",
+		"process_helper",
+	]) {
+		const path = join(directory, filename);
+		if (existsSync(path)) chmodSync(path, 0o755);
+	}
+}
+
+async function createPlatformDistFolder() {
+	// Create platform-specific dist folder (e.g., dist-linux-arm64)
+	const platformDistDir = `dist-${OS}-${ARCH}`;
+	console.log(`Creating platform-specific dist folder: ${platformDistDir}`);
+
+	mkdirSync(platformDistDir, { recursive: true });
+
+	// Copy all files from dist/ to platform-specific folder
+	if (OS === "win") {
+		rmSync(platformDistDir, { recursive: true, force: true });
+		// Keep this on Cottontail's native tree-copy path. Its older JavaScript
+		// fallback rounded large NTFS directory IDs and could report a false ELOOP;
+		// this generated staging mirror does not need source timestamps.
+		cpSync("dist", platformDistDir, {
+			recursive: true,
+			force: true,
+		});
+	} else if (OS === "macos") {
+		rmSync(platformDistDir, { recursive: true, force: true });
+		cpSync("dist", platformDistDir, {
+			recursive: true,
+			force: true,
+			preserveTimestamps: true,
+		});
+	} else {
+		// On Unix systems - use rsync with delete to ensure clean copy
+		// The --delete flag removes files in destination that don't exist in source
+		// This handles read-only files that might prevent overwriting
+		await $`rsync -a --delete dist/ ${platformDistDir}/`;
+	}
+	normalizeDistExecutableModes(platformDistDir);
+
+	// NOTE: We no longer remove adhoc signatures from binaries
+	// These signatures are actually required for the binaries to run on macOS
+	// The notarization issues were fixed by using proper entitlements and not using --deep
+
+	console.log(`Successfully created and populated ${platformDistDir}`);
+}
+
+function getPlatform() {
+	switch (platform()) {
+		case "win32":
+			return "win";
+		case "darwin":
+			return "macos";
+		case "linux":
+			return "linux";
+		default:
+			throw new Error("unsupported platform");
+	}
+}
+
+function getArch() {
+	const target = resolveBuildArch(arch(), args.arch ?? process.env["ELECTROBUN_BUILD_ARCH"]);
+	if (platform() !== "win32" && target !== arch()) throw new Error("Architecture cross compilation is only configured for Windows");
+	return target;
+}
+
+async function createDistFolder() {
+	await $`rm -rf dist`;
+	await $`mkdir -p dist/api`;
+	await $`mkdir -p dist/api/sdks`;
+	await $`mkdir -p dist/api/browser`;
+	if (OS === "win" || OS === "linux") {
+		await $`mkdir -p dist/cef`;
+	}
+}
+
+async function installPackageDependencies() {
+	if (OS === "win") {
+		const comSpec =
+			process.env["ComSpec"] ??
+			join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "cmd.exe");
+		runInherited(comSpec, ["/D", "/S", "/C", "npm.cmd", "install"]);
+		return;
+	}
+	await $`npm install`;
+}
+
+
+function verifyVendoredZig() {
+	if (OS === "win") assertWindowsBinaryArchitecture(PATH.zig.BIN, ZIG_HOST_ARCH);
+	const versionOutput = runCaptured(PATH.zig.BIN, ["version"]).trim();
+	if (versionOutput !== ZIG_VERSION) {
+		throw new Error(
+			`Vendored Zig version mismatch: expected ${ZIG_VERSION}, got "${versionOutput}"`,
+		);
+	}
+}
+
+async function vendorZig() {
+	const zigDir = join(process.cwd(), "vendors", "zig");
+	const zigVersionFile = join(zigDir, ".zig-version");
+
+	if (existsSync(PATH.zig.BIN)) {
+		try {
+			verifyVendoredZig();
+			const currentVersion = existsSync(zigVersionFile)
+				? readFileSync(zigVersionFile, "utf8").trim()
+				: ZIG_VERSION;
+			if (currentVersion === ZIG_VERSION) {
+				writeFileSync(zigVersionFile, ZIG_VERSION);
+				return;
+			}
+		} catch {
+			console.log("Existing Zig toolchain does not match the pinned version.");
+		}
+		await $`rm -rf ${zigDir}`;
+	}
+
+	// Zig 0.14+ archives are named zig-<arch>-<os>-<version> (arch before os).
+	if (OS === "macos") {
+		const zigArch = ARCH === "arm64" ? "aarch64" : "x86_64";
+		const zigFolder = `zig-${zigArch}-macos-${ZIG_VERSION}`;
+		await $`mkdir -p vendors/zig && curl -fL --retry 5 https://ziglang.org/download/${ZIG_VERSION}/${zigFolder}.tar.xz | tar -xJ --strip-components=1 -C vendors/zig ${zigFolder}/zig ${zigFolder}/lib ${zigFolder}/doc`;
+	} else if (OS === "win") {
+		// Compiler architecture follows the host, independently of --arch.
+		const zigArch = ZIG_HOST_ARCH === "arm64" ? "aarch64" : "x86_64";
+		const zigFolder = `zig-${zigArch}-windows-${ZIG_VERSION}`;
+		await $`rm -rf vendors/zig-temp vendors/zig.zip`;
+		await $`mkdir -p vendors/zig && curl -fL --retry 5 https://ziglang.org/download/${ZIG_VERSION}/${zigFolder}.zip -o vendors/zig.zip && powershell -ExecutionPolicy Bypass -Command Expand-Archive -Path vendors/zig.zip -DestinationPath vendors/zig-temp && mv vendors/zig-temp/${zigFolder}/zig.exe vendors/zig && mv vendors/zig-temp/${zigFolder}/lib vendors/zig/`;
+		await $`rm -rf vendors/zig-temp vendors/zig.zip`;
+	} else if (OS === "linux") {
+		const zigArch = ARCH === "arm64" ? "aarch64" : "x86_64";
+		const zigFolder = `zig-${zigArch}-linux-${ZIG_VERSION}`;
+		await $`mkdir -p vendors/zig && curl -fL --retry 5 https://ziglang.org/download/${ZIG_VERSION}/${zigFolder}.tar.xz | tar -xJ --strip-components=1 -C vendors/zig ${zigFolder}/zig ${zigFolder}/lib ${zigFolder}/doc`;
+	}
+
+	verifyVendoredZig();
+	writeFileSync(zigVersionFile, ZIG_VERSION);
+}
+
+function getRustHostTriple(): string {
+	return rustHostTriple({ os: OS, arch: HOST_ARCH });
+}
+
+async function verifyVendoredRust() {
+	const versionOutput = runCaptured(PATH.rust.BIN, ["-vV"]);
+	verifyRustToolchain(versionOutput, RUST_VERSION, { os: OS, arch: HOST_ARCH });
+}
+
+async function vendorRust() {
+	const rustDir = join(process.cwd(), "vendors", "rust");
+	const rustVersionFile = join(rustDir, ".rust-version");
+
+	if (existsSync(PATH.rust.BIN)) {
+		try {
+			const vendoredVersion = existsSync(rustVersionFile)
+				? readFileSync(rustVersionFile, "utf-8").trim()
+				: RUST_VERSION;
+			if (vendoredVersion === RUST_VERSION) {
+				await verifyVendoredRust();
+				writeFileSync(rustVersionFile, RUST_VERSION);
+				return;
+			}
+			console.log(
+				`Rust version mismatch: vendored "${vendoredVersion}" vs expected "${RUST_VERSION}"`,
+			);
+		} catch (error) {
+			console.log(`Existing Rust toolchain is not valid for this host: ${error instanceof Error ? error.message : error}`);
+		}
+
+		console.log("Cleaning stale Rust toolchain and re-vendoring...");
+		await $`rm -rf ${rustDir}`;
+	}
+
+	const rustTriple = getRustHostTriple();
+	const rustFolder = `rust-${RUST_VERSION}-${rustTriple}`;
+	const tempTarball = join("vendors", `rust-${RUST_VERSION}-${rustTriple}.tar.xz`);
+	const tempExtractDir = join("vendors", `rust-extract-${Date.now()}`);
+	const rustUrl = `https://static.rust-lang.org/dist/${rustFolder}.tar.xz`;
+
+	try {
+		await $`mkdir -p vendors ${tempExtractDir}`;
+		console.log(`Downloading Rust ${RUST_VERSION} for ${rustTriple}...`);
+		await $`curl -L "${rustUrl}" -o "${tempTarball}"`;
+		validateDownload(tempTarball, "rust");
+
+		await $`tar -xJf "${tempTarball}" -C "${tempExtractDir}"`;
+		const extractedDir = join(tempExtractDir, rustFolder);
+		const installScript = join(extractedDir, "install.sh");
+		if (!existsSync(installScript)) {
+			throw new Error(`Rust installer not found at ${installScript}`);
+		}
+
+		if (OS === "win") {
+			mkdirSync(rustDir, { recursive: true });
+			const componentsFile = join(extractedDir, "components");
+			const components = readFileSync(componentsFile, "utf-8")
+				.split(/\r?\n/)
+				.map((line) => line.trim())
+				.filter(Boolean);
+			for (const component of components) {
+				const componentDir = join(extractedDir, component);
+				for (const entry of readdirSync(componentDir, { withFileTypes: true })) {
+					if (entry.name === "manifest.in") continue;
+					cpSync(join(componentDir, entry.name), join(rustDir, entry.name), {
+						recursive: true,
+						force: true,
+					});
+				}
+			}
+		} else {
+			await $`sh "${installScript}" --prefix="${rustDir}" --disable-ldconfig`;
+		}
+		await verifyVendoredRust();
+		writeFileSync(rustVersionFile, RUST_VERSION);
+		console.log("✓ Rust toolchain vendored successfully");
+	} catch (error) {
+		console.error("Failed to vendor Rust:", error);
+		throw new Error("Could not vendor Rust toolchain.");
+	} finally {
+		await $`rm -f "${tempTarball}"`.catch(() => {});
+		await $`rm -rf "${tempExtractDir}"`.catch(() => {});
+	}
+}
+
+function getGoHostTuple(): { goOS: string; goArch: string } {
+	return goHostTuple({ os: OS, arch: HOST_ARCH });
+}
+
+async function verifyVendoredGo() {
+	const versionOutput = runCaptured(PATH.go.BIN, ["version"]);
+	verifyGoToolchain(versionOutput, GO_VERSION, { os: OS, arch: HOST_ARCH });
+}
+
+async function vendorGo() {
+	const goDir = join(process.cwd(), "vendors", "go");
+	const goVersionFile = join(goDir, ".go-version");
+
+	if (existsSync(PATH.go.BIN)) {
+		try {
+			const vendoredVersion = existsSync(goVersionFile)
+				? readFileSync(goVersionFile, "utf-8").trim()
+				: GO_VERSION;
+			if (vendoredVersion === GO_VERSION) {
+				await verifyVendoredGo();
+				writeFileSync(goVersionFile, GO_VERSION);
+				return;
+			}
+			console.log(
+				`Go version mismatch: vendored "${vendoredVersion}" vs expected "${GO_VERSION}"`,
+			);
+		} catch (error) {
+			console.log(`Existing Go toolchain is not valid for this host: ${error instanceof Error ? error.message : error}`);
+		}
+
+		console.log("Cleaning stale Go toolchain and re-vendoring...");
+		await $`rm -rf ${goDir}`;
+	}
+
+	const { goOS, goArch } = getGoHostTuple();
+	const archiveExt = OS === "win" ? "zip" : "tar.gz";
+	const archiveName = `go${GO_VERSION}.${goOS}-${goArch}.${archiveExt}`;
+	const tempArchive = join("vendors", archiveName);
+	const goUrl = `https://go.dev/dl/${archiveName}`;
+
+	try {
+		await $`mkdir -p vendors`;
+		console.log(`Downloading Go ${GO_VERSION} for ${goOS}-${goArch}...`);
+		await $`curl -L "${goUrl}" -o "${tempArchive}"`;
+		validateDownload(tempArchive, "go");
+
+		if (OS === "win") {
+			await $`powershell -ExecutionPolicy Bypass -Command Expand-Archive -Path "${tempArchive}" -DestinationPath vendors -Force`;
+		} else {
+			await $`tar -xzf "${tempArchive}" -C vendors`;
+		}
+
+		await verifyVendoredGo();
+		writeFileSync(goVersionFile, GO_VERSION);
+		console.log("✓ Go toolchain vendored successfully");
+	} catch (error) {
+		console.error("Failed to vendor Go:", error);
+		throw new Error("Could not vendor Go toolchain.");
+	} finally {
+		await $`rm -f "${tempArchive}"`.catch(() => {});
+	}
+}
+
+function getOdinReleaseAssetName(): string {
+	// Official prebuilt releases: https://github.com/odin-lang/Odin/releases
+	// Coverage as of dev-2026-07a: macos-amd64/arm64, linux-amd64/arm64, windows-amd64.
+	// There is NO windows-arm64 prebuilt; Windows builds are x64-only (matching
+	// Electrobun's current Windows target policy).
+	if (OS === "macos") {
+		const odinArch = ARCH === "arm64" ? "arm64" : "amd64";
+		return `odin-macos-${odinArch}-${ODIN_VERSION}.tar.gz`;
+	}
+	if (OS === "linux") {
+		const odinArch = ARCH === "arm64" ? "arm64" : "amd64";
+		return `odin-linux-${odinArch}-${ODIN_VERSION}.tar.gz`;
+	}
+	if (OS === "win") {
+		if (ARCH === "arm64") {
+			throw new Error(
+				"Odin does not publish windows-arm64 prebuilt toolchains. Odin main processes are only supported on x64 Windows.",
+			);
+		}
+		return `odin-windows-amd64-${ODIN_VERSION}.zip`;
+	}
+	throw new Error(`Unsupported platform for Odin toolchain: ${OS}`);
+}
+
+async function verifyVendoredOdin() {
+	const versionOutput = runCaptured(PATH.odin.BIN, ["version"]).trim();
+	// Release binaries self-report the month build (e.g. "dev-2026-07-nightly:819fdc7")
+	// rather than the release tag ("dev-2026-07a"), so match on the month prefix.
+	// The exact pinned tag is tracked via the .odin-version stamp file.
+	const expectedPrefix = ODIN_VERSION.replace(/[a-z]$/, "");
+	if (!versionOutput.includes(expectedPrefix)) {
+		throw new Error(
+			`Vendored Odin version mismatch: expected ${ODIN_VERSION} (${expectedPrefix}*), got "${versionOutput}"`,
+		);
+	}
+}
+
+async function vendorOdin() {
+	const odinDir = join(process.cwd(), "vendors", "odin");
+	const odinVersionFile = join(odinDir, ".odin-version");
+
+	if (existsSync(PATH.odin.BIN)) {
+		if (existsSync(odinVersionFile)) {
+			const vendoredVersion = readFileSync(odinVersionFile, "utf-8").trim();
+			if (vendoredVersion === ODIN_VERSION) {
+				await verifyVendoredOdin();
+				return;
+			}
+			console.log(
+				`Odin version mismatch: vendored "${vendoredVersion}" vs expected "${ODIN_VERSION}"`,
+			);
+		} else {
+			try {
+				await verifyVendoredOdin();
+				writeFileSync(odinVersionFile, ODIN_VERSION);
+				return;
+			} catch {
+				console.log("Odin vendor directory found without a valid version stamp.");
+			}
+		}
+
+		console.log("Cleaning stale Odin toolchain and re-vendoring...");
+		await $`rm -rf ${odinDir}`;
+	}
+
+	const assetName = getOdinReleaseAssetName();
+	const tempArchive = join("vendors", assetName);
+	const tempExtractDir = join("vendors", "odin-extract-temp");
+	const odinUrl = `https://github.com/odin-lang/Odin/releases/download/${ODIN_VERSION}/${assetName}`;
+
+	try {
+		await $`mkdir -p vendors`;
+		await $`rm -rf ${tempExtractDir}`;
+		console.log(`Downloading Odin ${ODIN_VERSION} (${assetName})...`);
+		await $`curl -L "${odinUrl}" -o "${tempArchive}"`;
+		validateDownload(tempArchive, "odin");
+
+		mkdirSync(tempExtractDir, { recursive: true });
+		if (OS === "win") {
+			await $`powershell -ExecutionPolicy Bypass -Command Expand-Archive -Path "${tempArchive}" -DestinationPath "${tempExtractDir}" -Force`;
+		} else {
+			await $`tar -xzf "${tempArchive}" -C "${tempExtractDir}"`;
+		}
+
+		// Release archives contain a single top-level folder (name varies by
+		// platform/release), which becomes vendors/odin. If files were extracted
+		// flat, use the extract dir directly.
+		const entries = readdirSync(tempExtractDir, { withFileTypes: true });
+		const topLevelDirs = entries.filter((entry) => entry.isDirectory());
+		const extractedRoot =
+			entries.length === 1 && topLevelDirs.length === 1
+				? join(tempExtractDir, topLevelDirs[0].name)
+				: tempExtractDir;
+
+		await $`rm -rf ${odinDir}`;
+		renameSync(extractedRoot, odinDir);
+		if (OS !== "win") {
+			chmodSync(PATH.odin.BIN, 0o755);
+		}
+
+		await verifyVendoredOdin();
+		writeFileSync(odinVersionFile, ODIN_VERSION);
+		console.log("✓ Odin toolchain vendored successfully");
+	} catch (error) {
+		console.error("Failed to vendor Odin:", error);
+		throw new Error("Could not vendor Odin toolchain.");
+	} finally {
+		await $`rm -f "${tempArchive}"`.catch(() => {});
+		await $`rm -rf "${tempExtractDir}"`.catch(() => {});
+	}
+}
+
+
+async function vendorBsdiff() {
+	const BSDIFF_VERSION = OWNED_BUILD_DEPENDENCY_VERSIONS["zig-bsdiff"];
+	const buildKey = `${BSDIFF_VERSION}-${OS}-${ARCH}`;
+	const bsdiffDir = join(process.cwd(), "vendors", "zig-bsdiff");
+	const bsdiffBin = join(bsdiffDir, "bsdiff" + binExt);
+	const bspatchBin = join(bsdiffDir, "bspatch" + binExt);
+	const versionFile = join(bsdiffDir, ".version");
+
+	if (
+		existsSync(bsdiffBin) &&
+		existsSync(bspatchBin) &&
+		existsSync(versionFile) &&
+		readFileSync(versionFile, "utf8").trim() === buildKey
+	) {
+		return;
+	}
+
+	rmSync(bsdiffDir, { recursive: true, force: true });
+	console.log("Downloading zig-bsdiff binaries...");
+	const tempTarball = join("vendors", `zig-bsdiff-temp.tar.gz`);
+
+	try {
+		await $`mkdir -p vendors/zig-bsdiff`;
+		await downloadOwnedBuildDependency(
+			"zig-bsdiff",
+			ARCH,
+			tempTarball,
+			"zig-bsdiff",
+		);
+		await $`tar -xzf ${tempTarball} -C vendors/zig-bsdiff`;
+
+		if (!existsSync(bsdiffBin) || !existsSync(bspatchBin)) {
+			throw new Error(`Binaries not found after extraction: ${bsdiffDir}`);
+		}
+
+		if (OS !== "win") {
+			await $`chmod +x ${bsdiffBin} ${bspatchBin}`;
+		}
+		writeFileSync(versionFile, buildKey);
+
+		console.log("✓ zig-bsdiff binaries downloaded successfully");
+	} catch (error: unknown) {
+		console.error(
+			"Failed to download zig-bsdiff binaries:",
+			error instanceof Error ? error.message : error,
+		);
+		throw new Error(`Failed to download zig-bsdiff binaries.`);
+	} finally {
+		rmSync(tempTarball, { force: true });
+	}
+}
+
+async function vendorZstd() {
+	const ZSTD_VERSION = OWNED_BUILD_DEPENDENCY_VERSIONS["zig-zstd"];
+	const buildKey = `${ZSTD_VERSION}-${OS}-${ARCH}`;
+	const zstdDir = join(process.cwd(), "vendors", "zig-zstd");
+	const zstdBin = join(zstdDir, "zig-zstd" + binExt);
+	const versionFile = join(zstdDir, ".version");
+
+	if (
+		existsSync(zstdBin) &&
+		existsSync(versionFile) &&
+		readFileSync(versionFile, "utf8").trim() === buildKey
+	) {
+		return;
+	}
+
+	rmSync(zstdDir, { recursive: true, force: true });
+	console.log("Downloading zig-zstd binaries...");
+	const tempTarball = join("vendors", `zig-zstd-temp.tar.gz`);
+
+	try {
+		await $`mkdir -p vendors/zig-zstd`;
+		await downloadOwnedBuildDependency(
+			"zig-zstd",
+			ARCH,
+			tempTarball,
+			"zig-zstd",
+		);
+		await $`tar -xzf ${tempTarball} -C vendors/zig-zstd`;
+
+		if (!existsSync(zstdBin)) {
+			throw new Error(`Binary not found after extraction: ${zstdDir}`);
+		}
+
+		if (OS !== "win") {
+			await $`chmod +x ${zstdBin}`;
+		}
+		writeFileSync(versionFile, buildKey);
+
+		console.log("✓ zig-zstd binaries downloaded successfully");
+	} catch (error: unknown) {
+		console.error(
+			"Failed to download zig-zstd binaries:",
+			error instanceof Error ? error.message : error,
+		);
+		throw new Error(`Failed to download zig-zstd binaries.`);
+	} finally {
+		rmSync(tempTarball, { force: true });
+	}
+}
+
+async function vendorWGPU() {
+	const WGPU_VERSION = OWNED_BUILD_DEPENDENCY_VERSIONS["electrobun-dawn"];
+	const wgpuBaseDir = join(process.cwd(), "vendors", "wgpu");
+	const wgpuDir = join(wgpuBaseDir, `${OS}-${ARCH}`);
+	const wgpuVersionFile = join(wgpuDir, ".wgpu-version");
+	const currentVersion = existsSync(wgpuVersionFile)
+		? readFileSync(wgpuVersionFile, "utf8").trim()
+		: null;
+
+	const libExt = OS === "win" ? ".dll" : OS === "macos" ? ".dylib" : ".so";
+	const libCandidates =
+		OS === "win"
+			? [
+					join(wgpuDir, "bin", "webgpu_dawn.dll"),
+					join(wgpuDir, "bin", "libwebgpu_dawn.dll"),
+					join(wgpuDir, "lib", "webgpu_dawn.dll"),
+					join(wgpuDir, "lib", "libwebgpu_dawn.dll"),
+				]
+			: [
+					join(wgpuDir, "lib", `libwebgpu_dawn${libExt}`),
+					join(wgpuDir, "lib", `libwebgpu_dawn_shared${libExt}`),
+				];
+
+	if (libCandidates.some((p) => existsSync(p)) && currentVersion === WGPU_VERSION) {
+		return;
+	}
+
+	if (currentVersion !== WGPU_VERSION && existsSync(wgpuDir)) {
+		await $`rm -rf "${wgpuDir}"`;
+	}
+
+	console.log("Downloading electrobun-dawn binaries...");
+	const tempTarball = join("vendors", `electrobun-dawn-temp.tar.gz`);
+	const tempExtractDir = join("vendors", `electrobun-dawn-extract-${Date.now()}`);
+
+	try {
+		await $`mkdir -p "${wgpuBaseDir}"`;
+		await $`rm -f "${tempTarball}"`;
+		await downloadOwnedBuildDependency(
+			"electrobun-dawn",
+			ARCH,
+			tempTarball,
+			"wgpu",
+		);
+
+		await $`rm -rf "${tempExtractDir}"`;
+		await $`mkdir -p "${tempExtractDir}"`;
+		await $`tar -xzf "${tempTarball}" -C "${tempExtractDir}"`;
+
+		const extracted = readdirSync(tempExtractDir);
+		if (extracted.length === 1) {
+			const single = join(tempExtractDir, extracted[0]!);
+			if (existsSync(wgpuDir)) {
+				await $`rm -rf "${wgpuDir}"`;
+			}
+			await $`mv "${single}" "${wgpuDir}"`;
+		} else {
+			if (existsSync(wgpuDir)) {
+				await $`rm -rf "${wgpuDir}"`;
+			}
+			await $`mkdir -p "${wgpuDir}"`;
+			for (const item of extracted) {
+				await $`mv "${join(tempExtractDir, item)}" "${wgpuDir}/"`;
+			}
+		}
+
+		if (!libCandidates.some((p) => existsSync(p))) {
+			throw new Error(`WGPU library not found after extraction: ${wgpuDir}`);
+		}
+
+		writeFileSync(wgpuVersionFile, WGPU_VERSION);
+
+		// Regenerate main-process FFI bindings when the WGPU version changes.
+		if (!existsSync(join(process.cwd(), "src", "sdks", "main", "webGPU.ts"))) {
+			await $`node scripts/gen-webgpu-ffi.mjs`;
+		} else if (currentVersion !== WGPU_VERSION) {
+			await $`node scripts/gen-webgpu-ffi.mjs`;
+		}
+
+		console.log("✓ electrobun-dawn binaries downloaded successfully");
+	} catch (error: unknown) {
+		console.error(
+			"Failed to download electrobun-dawn binaries:",
+			error instanceof Error ? error.message : error,
+		);
+		throw new Error(`Failed to download electrobun-dawn binaries.`);
+	} finally {
+		rmSync(tempTarball, { force: true });
+		rmSync(tempExtractDir, { recursive: true, force: true });
+	}
+}
+
+async function vendorAsar() {
+	const ASAR_VERSION = OWNED_BUILD_DEPENDENCY_VERSIONS["zig-asar"];
+	const buildKey = `${ASAR_VERSION}-${OS}-${ARCH}`;
+	const asarBaseDir = join(process.cwd(), "vendors", "zig-asar");
+	const versionFile = join(asarBaseDir, ".version");
+	const versionMatches =
+		existsSync(versionFile) &&
+		readFileSync(versionFile, "utf8").trim() === buildKey;
+	const archsToDownload: BuildDependencyArch[] = [ARCH];
+
+	if (!versionMatches) {
+		rmSync(asarBaseDir, { recursive: true, force: true });
+	}
+
+	for (const targetArch of archsToDownload) {
+		const asarDir = OS === "win" ? join(asarBaseDir, targetArch) : asarBaseDir;
+		const asarCli = join(asarDir, "zig-asar" + binExt);
+		const libExt = OS === "win" ? ".dll" : OS === "macos" ? ".dylib" : ".so";
+		const asarLib = join(asarDir, "libasar" + libExt);
+		const requiredFiles = [asarCli, asarLib];
+
+		if (versionMatches && requiredFiles.every((f) => existsSync(f))) {
+			continue;
+		}
+
+		console.log(`Downloading zig-asar binaries for ${OS}-${targetArch}...`);
+		const tempTarball = join("vendors", `zig-asar-temp-${targetArch}.tar.gz`);
+
+		try {
+			await $`mkdir -p "${asarDir}"`;
+			await downloadOwnedBuildDependency(
+				"zig-asar",
+				targetArch,
+				tempTarball,
+				"zig-asar",
+			);
+			await $`tar -xzf "${tempTarball}" -C "${asarDir}"`;
+
+			const missingFiles = requiredFiles.filter((f) => !existsSync(f));
+			if (missingFiles.length > 0) {
+				console.error("Missing files after extraction:", missingFiles);
+				console.error("Files found in", asarDir + ":");
+				if (existsSync(asarDir)) {
+					const files = await $`ls -la "${asarDir}"`.quiet();
+					console.error(files.stdout.toString());
+				}
+				throw new Error(`Required ASAR files not found after extraction`);
+			}
+
+			if (OS !== "win") {
+				await $`chmod +x ${asarCli}`;
+			}
+
+			console.log(
+				`✓ zig-asar binaries for ${targetArch} downloaded successfully`,
+			);
+		} catch (error: unknown) {
+			console.error(
+				`Failed to download zig-asar binaries for ${targetArch}:`,
+				error instanceof Error ? error.message : error,
+			);
+			throw new Error(`Failed to download zig-asar binaries.`);
+		} finally {
+			rmSync(tempTarball, { force: true });
+		}
+	}
+	writeFileSync(versionFile, buildKey);
+}
+
+function macCefBuildDir(): string {
+	return join(process.cwd(), "vendors", "cef", "build");
+}
+
+function macCefBuildStamp(): string {
+	return join(macCefBuildDir(), ".electrobun-macos-deployment-target");
+}
+
+function macCefBuildIsCurrent(wrapperPath: string): boolean {
+	return (
+		existsSync(wrapperPath) &&
+		existsSync(macCefBuildStamp()) &&
+		readFileSync(macCefBuildStamp(), "utf8").trim() === `${ARCH}-${MACOS_DEPLOYMENT_TARGET}`
+	);
+}
+
+async function buildMacCefWrapper(): Promise<string> {
+	const buildDir = macCefBuildDir();
+	const wrapperPath = join(buildDir, "libcef_dll_wrapper", "libcef_dll_wrapper.a");
+	const buildArch = macosNativeArchitecture(ARCH);
+
+	rmSync(buildDir, { recursive: true, force: true });
+	mkdirSync(buildDir, { recursive: true });
+	await $`cd ${buildDir} && "${CMAKE_BIN}" -DPROJECT_ARCH=${buildArch} -DCMAKE_OSX_ARCHITECTURES=${buildArch} -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOS_DEPLOYMENT_TARGET} .. && make -j8 libcef_dll_wrapper`;
+
+	if (!existsSync(wrapperPath)) {
+		throw new Error(`CEF wrapper library not found at ${wrapperPath}`);
+	}
+	writeFileSync(macCefBuildStamp(), `${ARCH}-${MACOS_DEPLOYMENT_TARGET}\n`);
+	return wrapperPath;
+}
+
+async function vendorCEF() {
+	// CEF_VERSION, CHROMIUM_VERSION, and DEFAULT_CEF_VERSION_STRING are imported from src/shared/cef-version.ts
+	const expectedVersionString = `${DEFAULT_CEF_VERSION_STRING}-${OS}-${ARCH}`;
+
+	// Keep per-platform aliases for backward compatibility in URL construction below.
+	const CEF_VERSION_MAC = CEF_VERSION;
+	const CHROMIUM_VERSION_MAC = CHROMIUM_VERSION;
+	const CEF_VERSION_WIN = CEF_VERSION;
+	const CHROMIUM_VERSION_WIN = CHROMIUM_VERSION;
+	const CEF_VERSION_LINUX = CEF_VERSION;
+	const CHROMIUM_VERSION_LINUX = CHROMIUM_VERSION;
+
+	// Check if vendored CEF version matches expected version.
+	// When the hardcoded version is bumped (e.g. after a git pull),
+	// this detects the mismatch and forces a clean re-vendor + rebuild.
+	const cefDir = join(process.cwd(), "vendors", "cef");
+	const versionFile = join(cefDir, ".cef-version");
+
+	if (existsSync(cefDir) && existsSync(versionFile)) {
+		const vendoredVersion = readFileSync(versionFile, "utf-8").trim();
+		if (vendoredVersion !== expectedVersionString) {
+			console.log(
+				`CEF version mismatch: vendored "${vendoredVersion}" vs expected "${expectedVersionString}"`,
+			);
+			console.log("Cleaning stale CEF artifacts and re-vendoring...");
+			// Remove stale CEF vendor directory
+			await $`rm -rf vendors/cef`;
+			// Remove stale build artifacts compiled against old CEF
+			await $`rm -f src/native/build/process_helper src/native/build/process_helper.exe`;
+			await $`rm -f src/native/build/process_helper_mac.o src/native/build/process_helper_win.obj src/native/linux/build/process_helper_linux.o`;
+			await $`rm -f src/native/build/libNativeWrapper.dylib src/native/build/libNativeWrapper.so src/native/build/libNativeWrapper_cef.so`;
+			await $`rm -f src/native/win/build/libNativeWrapper.dll src/native/win/build/nativeWrapper.obj`;
+			await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o src/native/linux/build/wayland_screen_capture.o src/native/linux/build/wayland_pipewire_capture.o`;
+		}
+	} else if (existsSync(cefDir) && !existsSync(versionFile)) {
+		// CEF dir exists but no version file (legacy state) — force re-vendor
+		console.log(
+			"CEF vendor directory found without version stamp, cleaning...",
+		);
+		await $`rm -rf vendors/cef`;
+		await $`rm -f src/native/build/process_helper src/native/build/process_helper.exe`;
+		await $`rm -f src/native/build/process_helper_mac.o src/native/build/process_helper_win.obj src/native/linux/build/process_helper_linux.o`;
+		await $`rm -f src/native/build/libNativeWrapper.dylib src/native/build/libNativeWrapper.so src/native/build/libNativeWrapper_cef.so`;
+		await $`rm -f src/native/win/build/libNativeWrapper.dll src/native/win/build/nativeWrapper.obj`;
+		await $`rm -f src/native/macos/build/nativeWrapper.o src/native/linux/build/nativeWrapper.o src/native/linux/build/wayland_screen_capture.o src/native/linux/build/wayland_pipewire_capture.o`;
+	}
+
+	if (OS === "macos") {
+		if (!existsSync(join(process.cwd(), "vendors", "cef"))) {
+			const cefArch = ARCH === "arm64" ? "macosarm64" : "macosx64";
+			console.log(`Downloading CEF for macOS ${ARCH}...`);
+			const cefUrl = `https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_MAC}+chromium-${CHROMIUM_VERSION_MAC}_${cefArch}_minimal.tar.bz2`;
+			console.log("CEF URL:", cefUrl);
+
+			// Never fall back to an older Chromium build when the pinned artifact
+			// is temporarily unavailable: that silently removes security updates.
+			await $`mkdir -p vendors`;
+			const tempFile = "vendors/cef_temp.tar.bz2";
+			await $`curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 "${cefUrl}" -o "${tempFile}"`;
+
+			// Validate download
+			validateDownload(tempFile, "cef");
+
+			console.log("CEF download completed, extracting...");
+
+			// Extract CEF
+			await $`mkdir -p vendors/cef`;
+			try {
+				await $`tar -xjf "${tempFile}" --strip-components=1 -C vendors/cef`;
+				console.log("CEF extraction completed");
+			} catch (error) {
+				console.log("Tar extraction failed, trying alternative method...");
+				// Try without strip-components first
+				await $`tar -xjf "${tempFile}" -C vendors/`;
+
+				// List what was extracted
+				const vendorContents = await $`ls vendors/`.text();
+				console.log("Extracted contents:", vendorContents);
+
+				// Try to find the CEF directory and move it
+				const dirName = vendorContents
+					.split("\n")
+					.find((line) => line.startsWith("cef_binary_"));
+				if (dirName) {
+					await $`mv vendors/${dirName.trim()}/* vendors/cef/`;
+					await $`rmdir vendors/${dirName.trim()}`;
+					console.log("Moved CEF contents to vendors/cef");
+				}
+			}
+
+			// Clean up temp file
+			await $`rm "${tempFile}"`;
+
+			// List what's in the cef directory
+			try {
+				const cefContents = await $`ls vendors/cef/`.text();
+				console.log("CEF directory contents:", cefContents);
+			} catch {
+				console.log("Could not list CEF directory contents");
+			}
+
+			// Verify CEF was extracted properly
+			if (
+				!existsSync(join(process.cwd(), "vendors", "cef", "CMakeLists.txt"))
+			) {
+				throw new Error(
+					"CEF download/extraction failed - CMakeLists.txt not found",
+				);
+			}
+			// Write version stamp so future builds can detect staleness
+			writeFileSync(
+				join(process.cwd(), "vendors", "cef", ".cef-version"),
+				expectedVersionString,
+			);
+			console.log("CEF downloaded and extracted successfully");
+		}
+
+		// Build process_helper and the CEF wrapper against Electrobun's supported
+		// deployment target. The stamp invalidates locally cached CMake objects.
+		const processHelperPath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"build",
+			"process_helper",
+		);
+		const wrapperPath = join(
+			macCefBuildDir(),
+			"libcef_dll_wrapper",
+			"libcef_dll_wrapper.a",
+		);
+		const helperSourcePath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"macos",
+			"cef_process_helper_mac.cc",
+		);
+		const wrapperNeedsBuild = !macCefBuildIsCurrent(wrapperPath);
+		const helperNeedsBuild = outputMissingOrOlder(processHelperPath, [
+			helperSourcePath,
+		]);
+		if (helperNeedsBuild || wrapperNeedsBuild) {
+			await $`mkdir -p src/native/build`;
+			if (wrapperNeedsBuild) {
+				console.log("Building CEF wrapper library...");
+				await buildMacCefWrapper();
+				console.log("CEF wrapper library built successfully");
+			}
+
+			// build helper
+			await $`xcrun --sdk macosx clang++ ${macosClangTargetFlags} -std=c++20 -ObjC++ -fobjc-arc -I./vendors/cef -c src/native/macos/cef_process_helper_mac.cc -o src/native/build/process_helper_mac.o`;
+			// link
+			await $`xcrun --sdk macosx clang++ ${macosClangTargetFlags} -std=c++20 src/native/build/process_helper_mac.o -o src/native/build/process_helper -framework Cocoa -framework WebKit -framework QuartzCore -F./vendors/cef/Release -framework "Chromium Embedded Framework" -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++`;
+			// fix internal path
+			// Note: Can use `otool -L src/native/build/process_helper` to check the value
+			await $`install_name_tool -change "@executable_path/../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework" "@executable_path/../../../../Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework" src/native/build/process_helper`;
+		}
+	} else if (OS === "win") {
+		if (!existsSync(join(process.cwd(), "vendors", "cef"))) {
+			// Download Windows CEF binaries (minimal distribution)
+			const tempPath = join(process.cwd(), "vendors", "cef_temp.tar.bz2");
+			mkdirSync(join(process.cwd(), "vendors"), { recursive: true });
+
+			// Download CEF - using URL encoding for the + character
+			console.log("Downloading CEF binaries...");
+			const cefArch = WINDOWS_TARGET.cef;
+			console.log(`Downloading CEF for Windows ${ARCH}...`);
+			await $`curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 "https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_WIN}%2Bchromium-${CHROMIUM_VERSION_WIN}_${cefArch}_minimal.tar.bz2" -o "${tempPath}"`;
+
+			// Validate download
+			validateDownload(tempPath, "cef");
+
+			// Extract using tar (Windows 10+ has built-in tar support)
+			console.log("Extracting CEF...");
+			mkdirSync(join(process.cwd(), "vendors", "cef"), { recursive: true });
+
+			console.log("Extracting with tar (this may take a few minutes)...");
+			console.log(
+				"Note: Windows tar extraction of bz2 files can be slow, please be patient...",
+			);
+
+			try {
+				await $`tar -xjf "${tempPath}" --strip-components=1 -C vendors/cef`;
+			} finally {
+				rmSync(tempPath, { force: true });
+			}
+
+			// Verify extraction worked
+			const cefCMakeFile = join(
+				process.cwd(),
+				"vendors",
+				"cef",
+				"CMakeLists.txt",
+			);
+			if (!existsSync(cefCMakeFile)) {
+				throw new Error("CEF extraction failed - CMakeLists.txt not found");
+			}
+			// Write version stamp so future builds can detect staleness
+			writeFileSync(
+				join(process.cwd(), "vendors", "cef", ".cef-version"),
+				expectedVersionString,
+			);
+			console.log("CEF extracted successfully");
+		}
+
+		// Build CEF wrapper library for Windows
+		if (
+			!existsSync(getWindowsCefWrapperLibPath())
+		) {
+			// Clean and create build directory
+			await $`cd vendors/cef && powershell -command "if (Test-Path build) { Remove-Item -Recurse -Force build }"`;
+			await $`cd vendors/cef && mkdir build`;
+			const cmakeGenerator = getWindowsCmakeGenerator();
+			const generatorArgs =
+				cmakeGenerator === "Visual Studio 17 2022"
+					? `-G "${cmakeGenerator}" -A ${WINDOWS_TARGET.cmake}`
+					: `-G "${cmakeGenerator}"`;
+
+			// Generate the CEF wrapper project with sandbox disabled.
+			// When vcvarsall is available, prefer an MSVC toolchain generator that
+			// does not require a full Visual Studio IDE instance to be discoverable.
+			await runMsvcCommand(
+				`cd vendors\\cef\\build && "${CMAKE_BIN}" ${generatorArgs} -DPROJECT_ARCH=${ARCH === "arm64" ? "arm64" : "x86_64"} -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release ..`,
+			);
+			// Build the wrapper library only.
+			await runMsvcCommand(
+				`cd vendors\\cef\\build && "${CMAKE_BIN}" --build . --target libcef_dll_wrapper`,
+			);
+		}
+
+		// Build process_helper binary for Windows
+		const processHelperPath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"build",
+			"process_helper.exe",
+		);
+		const processHelperSourcePath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"win",
+			"cef_process_helper_win.cpp",
+		);
+		if (outputMissingOrOlder(processHelperPath, [processHelperSourcePath])) {
+			await $`mkdir -p src/native/build`;
+
+			const cefInclude = `./vendors/cef`;
+			const cefLib = `./vendors/cef/Release/libcef.lib`;
+			const cefWrapperLib = getWindowsCefWrapperLibPath();
+
+			// Compile the Windows helper process
+			await runMsvcCommand(
+				`cl /c /EHsc /std:c++20 /DNOMINMAX /I"${cefInclude}" /D_USRDLL /D_WINDLL /Fosrc/native/build/process_helper_win.obj src/native/win/cef_process_helper_win.cpp`,
+			);
+
+			// Link to create the helper executable
+			await runMsvcCommand(
+				`link /OUT:src/native/build/process_helper.exe user32.lib ole32.lib shell32.lib "${cefLib}" "${cefWrapperLib}" /SUBSYSTEM:WINDOWS src/native/build/process_helper_win.obj`,
+			);
+		}
+	} else if (OS === "linux") {
+		if (!existsSync(join(process.cwd(), "vendors", "cef"))) {
+			const cefArch = ARCH === "arm64" ? "linuxarm64" : "linux64";
+			console.log(`Downloading CEF for Linux ${ARCH}...`);
+			await $`mkdir -p vendors/cef && curl -fL --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 30 "https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION_LINUX}%2Bchromium-${CHROMIUM_VERSION_LINUX}_${cefArch}_minimal.tar.bz2" -o vendors/cef_temp.tar.bz2`;
+			validateDownload("vendors/cef_temp.tar.bz2", "cef");
+			await $`tar -xjf vendors/cef_temp.tar.bz2 --strip-components=1 -C vendors/cef`;
+			await $`rm vendors/cef_temp.tar.bz2`;
+			// Write version stamp so future builds can detect staleness
+			writeFileSync(
+				join(process.cwd(), "vendors", "cef", ".cef-version"),
+				expectedVersionString,
+			);
+		}
+
+		// Build CEF wrapper library for Linux
+		if (
+			!existsSync(
+				join(
+					process.cwd(),
+					"vendors",
+					"cef",
+					"build",
+					"libcef_dll_wrapper",
+					"libcef_dll_wrapper.a",
+				),
+			)
+		) {
+			console.log("Building CEF wrapper library for Linux...");
+			await $`cd vendors/cef && rm -rf build && mkdir -p build`;
+
+			if (ARCH === "arm64") {
+				// For ARM64, we need to modify CEF's cmake files to remove -m64 flags
+				console.log("Patching CEF cmake files for ARM64...");
+
+				// Replace -m64 and -march=x86-64 with ARM64 equivalents in cef_variables.cmake
+				const cefVariablesPath = join(
+					process.cwd(),
+					"vendors",
+					"cef",
+					"cmake",
+					"cef_variables.cmake",
+				);
+				if (existsSync(cefVariablesPath)) {
+					let cefVariables = readFileSync(cefVariablesPath, "utf-8");
+					cefVariables = cefVariables.replace(/-m64/g, "");
+					cefVariables = cefVariables.replace(
+						/-march=x86-64/g,
+						"-march=armv8-a",
+					);
+					writeFileSync(cefVariablesPath, cefVariables);
+				}
+
+				await $`cd vendors/cef/build && "${CMAKE_BIN}" -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release -DPROJECT_ARCH=arm64 ..`;
+			} else {
+				await $`cd vendors/cef/build && "${CMAKE_BIN}" -DCEF_USE_SANDBOX=OFF -DCMAKE_BUILD_TYPE=Release ..`;
+			}
+
+			await $`cd vendors/cef/build && make -j$(nproc) libcef_dll_wrapper`;
+		}
+
+		// Build process_helper binary for Linux
+		const processHelperPath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"build",
+			"process_helper",
+		);
+		const processHelperSourcePath = join(
+			process.cwd(),
+			"src",
+			"native",
+			"linux",
+			"cef_process_helper_linux.cpp",
+		);
+		if (outputMissingOrOlder(processHelperPath, [processHelperSourcePath])) {
+			console.log("Building CEF process helper for Linux...");
+			await $`mkdir -p src/native/build`;
+
+			const cefInclude = `./vendors/cef`;
+			const cefLib = `./vendors/cef/Release/libcef.so`;
+			const cefWrapperLib = `./vendors/cef/build/libcef_dll_wrapper/libcef_dll_wrapper.a`;
+
+			// Compile the Linux helper process
+			await $`g++ -c -std=c++20 -I"${cefInclude}" -o src/native/build/process_helper_linux.o src/native/linux/cef_process_helper_linux.cpp`;
+
+			// Link to create the helper executable
+			await $`g++ -o src/native/build/process_helper src/native/build/process_helper_linux.o "${cefWrapperLib}" "${cefLib}" -Wl,-rpath,'$ORIGIN' -lpthread -ldl`;
+		}
+	}
+}
+
+async function vendorNuget() {
+	if (OS === "win") {
+		if (existsSync(join(process.cwd(), "vendors", "nuget", "nuget.exe"))) {
+			return;
+		}
+
+		// install nuget package manager
+		await $`mkdir -p vendors/nuget && curl -L -o vendors/nuget/nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe`;
+	}
+}
+
+async function vendorWebview2() {
+	if (OS === "win") {
+		if (existsSync(join(process.cwd(), "vendors", "webview2"))) {
+			return;
+		}
+
+		await vendorNuget();
+
+		// install nuget package manager
+		await $`vendors/nuget/nuget.exe install Microsoft.Web.WebView2 -OutputDirectory vendors/webview2`;
+
+		const webview2BasePath = "./vendors/webview2";
+		const webview2Dir = readdirSync(webview2BasePath).find((dir: string) =>
+			dir.startsWith("Microsoft.Web.WebView2"),
+		);
+
+		if (webview2Dir && webview2Dir !== "Microsoft.Web.WebView2") {
+			const oldPath = join(webview2BasePath, webview2Dir);
+			const newPath = join(webview2BasePath, "Microsoft.Web.WebView2");
+
+			try {
+				renameSync(oldPath, newPath);
+				console.log(`Renamed ${webview2Dir} to Microsoft.Web.WebView2`);
+			} catch (error) {
+				console.error("Error renaming folder:", error);
+			}
+		}
+	}
+}
+
+async function vendorLinuxDeps() {
+	if (OS === "linux") {
+		// We can't check the package manager of every Linux distro,
+		// so lets just do Ubuntu/Debian for now since thats what CI uses.
+
+		const requiredPackages = [
+			"build-essential",
+			"cmake",
+			"pkg-config",
+			"libgtk-3-dev",
+			"libwebkit2gtk-4.1-dev",
+			"libayatana-appindicator3-dev",
+			"libpipewire-0.3-dev",
+			"librsvg2-dev",
+			"fuse",
+			"libfuse2",
+		];
+
+		const distroInfo = await $`grep -E '^(ID|ID_LIKE)=' /etc/os-release`.catch(
+			() => null,
+		);
+		if (
+			!distroInfo ||
+			!(
+				String(distroInfo.stdout).includes("debian") ||
+				String(distroInfo.stdout).includes("ubuntu")
+			)
+		) {
+			console.log(
+				"Cannot determine Linux distro or not Debian/Ubuntu based - skipping automatic dependency check",
+			);
+			console.log(
+				`Please ensure required packages are installed: ${requiredPackages.join(", ")}`,
+			);
+			return;
+		}
+
+		console.log("Detected Debian/Ubuntu based Linux. Checking dependencies...");
+		const missingPackages: string[] = [];
+		for (const pkg of requiredPackages) {
+			const result = await $`dpkg -l | grep ${pkg}`.catch(() => null);
+			if (!result || String(result.stdout).trim() === "") {
+				missingPackages.push(pkg);
+			}
+		}
+		if (missingPackages.length > 0) {
+			console.log("");
+			console.log(
+				"═══════════════════════════════════════════════════════════════",
+			);
+			console.log("🚨 MISSING REQUIRED LINUX DEPENDENCIES");
+			console.log(
+				"═══════════════════════════════════════════════════════════════",
+			);
+			console.log(`Missing packages: ${missingPackages.join(", ")}`);
+			console.log("");
+			console.log("Please install them using:");
+			console.log(
+				`   sudo apt update && sudo apt install -y ${missingPackages.join(" ")}`,
+			);
+			console.log("");
+
+			// Check specifically for libfuse2 since it affects AppImage creation
+			if (missingPackages.includes("libfuse2")) {
+				console.log("⚠️  libfuse2 is required for AppImage creation");
+				console.log(
+					"   Without it, AppImage generation will fail with FUSE errors",
+				);
+				console.log("");
+			}
+
+			// In CI, just warn but continue; locally show message and continue
+			if (process.env["GITHUB_ACTIONS"]) {
+				console.warn("⚠️  Running in CI - continuing despite missing packages");
+				console.warn(
+					"   The CI workflow should have already installed these packages",
+				);
+			} else {
+				console.warn("⚠️  Some features may not work without these packages");
+				console.warn("   Continuing with build...");
+			}
+			console.log(
+				"═══════════════════════════════════════════════════════════════",
+			);
+			console.log("");
+		}
+		console.log("All required packages are installed");
+	}
+}
+
+function writeNativeCompileFlags(
+	platform: NativeCompilePlatform,
+	compileFlags: readonly string[],
+): void {
+	const outputPath = join(
+		process.cwd(),
+		"src",
+		"native",
+		"compile_flags.txt",
+	);
+	writeFileSync(
+		outputPath,
+		serializeNativeCompileFlags(platform, compileFlags),
+	);
+	console.log(`Generated ${outputPath} for clangd`);
+}
+
+async function buildNative() {
+	if (OS === "macos") {
+		// Ensure CEF wrapper library is built first
+		const wrapperPath = join(
+			process.cwd(),
+			"vendors",
+			"cef",
+			"build",
+			"libcef_dll_wrapper",
+			"libcef_dll_wrapper.a",
+		);
+		if (!macCefBuildIsCurrent(wrapperPath)) {
+			console.log("CEF wrapper library not found, building it now...");
+			await buildMacCefWrapper();
+		}
+
+		const wgpuIncludeDir = join(
+			process.cwd(),
+			"vendors",
+			"wgpu",
+			`${OS}-${ARCH}`,
+			"include",
+		);
+		const cefInclude = join(process.cwd(), "vendors", "cef");
+		const sdkPathResult =
+			await $`xcrun --sdk macosx --show-sdk-path`.quiet();
+		const sdkPath = sdkPathResult.stdout.toString().trim();
+		if (!sdkPath) {
+			throw new Error("xcrun did not return a macOS SDK path");
+		}
+		const compileFlags = [
+			...macosClangTargetFlags,
+			"-fobjc-arc",
+			"-fno-objc-msgsend-selector-stubs",
+			`-I${cefInclude}`,
+			...(existsSync(wgpuIncludeDir) ? [`-I${wgpuIncludeDir}`] : []),
+			"-std=c++20",
+			"-isysroot",
+			sdkPath,
+		];
+		writeNativeCompileFlags("macos", compileFlags);
+		await $`mkdir -p src/native/macos/build`;
+		await $`xcrun --sdk macosx clang++ -c src/native/macos/nativeWrapper.mm -o src/native/macos/build/nativeWrapper.o ${compileFlags}`;
+		await $`mkdir -p src/native/build && xcrun --sdk macosx clang++ ${macosClangTargetFlags} -o src/native/build/libNativeWrapper.dylib src/native/macos/build/nativeWrapper.o ./vendors/zig-asar/libasar.dylib -framework Cocoa -framework WebKit -framework QuartzCore -framework Metal -framework MetalKit -framework Network -framework UserNotifications -framework Security -F./vendors/cef/Release -weak_framework 'Chromium Embedded Framework' -L./vendors/cef/build/libcef_dll_wrapper -lcef_dll_wrapper -stdlib=libc++ -shared -install_name @executable_path/libNativeWrapper.dylib -Wl,-rpath,@executable_path`;
+	} else if (OS === "win") {
+		const webview2Include = join(
+			process.cwd(),
+			"vendors",
+			"webview2",
+			"Microsoft.Web.WebView2",
+			"build",
+			"native",
+			"include",
+		);
+		const webview2Arch = WINDOWS_TARGET.webview2;
+		const webview2Lib = `./vendors/webview2/Microsoft.Web.WebView2/build/native/${webview2Arch}/WebView2LoaderStatic.lib`;
+		const cefInclude = join(process.cwd(), "vendors", "cef");
+		const cefLib = `./vendors/cef/Release/libcef.lib`;
+		const cefWrapperLib = getWindowsCefWrapperLibPath();
+
+		const wgpuIncludeDir = join(
+			process.cwd(),
+			"vendors",
+			"wgpu",
+			`win-${ARCH}`,
+			"include",
+		);
+		// Dawn native lib for zero-copy DComp bridge (D3D11On12 interop)
+		const wgpuLibDir = join(
+			process.cwd(),
+			"vendors",
+			"wgpu",
+			`win-${ARCH}`,
+			"lib",
+		);
+		const wgpuLib = existsSync(join(wgpuLibDir, "webgpu_dawn.lib"))
+			? `"${join(wgpuLibDir, "webgpu_dawn.lib")}"`
+			: "";
+
+		// Compile the main wrapper with both WebView2 and CEF support (runtime detection)
+		// Use /MT to statically link the C runtime (matches libcpmt.lib that CEF uses)
+		const compileFlags = [
+			"/EHsc",
+			"/std:c++20",
+			"/DNOMINMAX",
+			"/MT",
+			`/I${webview2Include}`,
+			`/I${cefInclude}`,
+			...(existsSync(wgpuIncludeDir) ? [`/I${wgpuIncludeDir}`] : []),
+			"/D_USRDLL",
+			"/D_WINDLL",
+		];
+		writeNativeCompileFlags("win", compileFlags);
+		await $`mkdir -p src/native/win/build`;
+		await runMsvcCommand(
+			formatWindowsBatchCommand([
+				"cl",
+				"/c",
+				...compileFlags,
+				"/Fosrc/native/win/build/nativeWrapper.obj",
+				"src/native/win/nativeWrapper.cpp",
+			]),
+		);
+
+		// Link with both WebView2 and CEF libraries using DelayLoad for CEF (similar to macOS weak linking)
+		// Note: ASAR reading is now implemented directly in C++ (no external library needed)
+		// webgpu_dawn.lib: Dawn native API for D3D11On12 zero-copy bridge
+		// d3d12.lib: D3D12 types used by D3D11On12 interop
+		// DELAYLOAD webgpu_dawn.dll: only loaded when zero-copy bridge is used
+		await runMsvcCommand(
+			`link /DLL /MANIFEST:EMBED /OUT:src/native/win/build/libNativeWrapper.dll user32.lib ole32.lib shell32.lib shlwapi.lib advapi32.lib dcomp.lib d2d1.lib d3d12.lib kernel32.lib comctl32.lib ${wgpuLib} "${webview2Lib}" "${cefLib}" "${cefWrapperLib}" delayimp.lib /DELAYLOAD:libcef.dll /DELAYLOAD:webgpu_dawn.dll libcmt.lib /IMPLIB:src/native/win/build/libNativeWrapper.lib src/native/win/build/nativeWrapper.obj`,
+		);
+	} else if (OS === "linux") {
+		// Skip package checks in CI or continue anyway if packages are missing
+		if (!process.env["GITHUB_ACTIONS"]) {
+			try {
+				// Check if required packages are available first
+				await $`pkg-config --exists webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`;
+				console.log("✓ All required packages found via pkg-config");
+			} catch (error) {
+				console.warn(
+					"⚠️  Warning: Some packages might be missing (pkg-config check failed)",
+				);
+				console.warn(
+					"   Continuing anyway - build may fail if packages are actually missing",
+				);
+			}
+		} else {
+			console.log("Running in CI - skipping package checks");
+		}
+
+		try {
+			// Always include CEF headers for Linux builds
+			const cefInclude = join(process.cwd(), "vendors", "cef");
+			const wgpuIncludeDir = join(
+				process.cwd(),
+				"vendors",
+				"wgpu",
+				`${OS}-${ARCH}`,
+				"include",
+			);
+			const cefLib = join(
+				process.cwd(),
+				"vendors",
+				"cef",
+				"Release",
+				"libcef.so",
+			);
+			const cefWrapperLib = join(
+				process.cwd(),
+				"vendors",
+				"cef",
+				"build",
+				"libcef_dll_wrapper",
+				"libcef_dll_wrapper.a",
+			);
+
+			// Check if CEF libraries exist for linking
+			const cefLibsExist = existsSync(cefWrapperLib) && existsSync(cefLib);
+
+			if (cefLibsExist) {
+				console.log("CEF libraries found, building with full CEF support");
+			} else {
+				console.log(
+					"CEF libraries not found, building with CEF headers only (runtime detection)",
+				);
+			}
+
+			// Get pkg-config flags, falling back to manual flags if not available
+			let pkgConfigCflags = "";
+			let pkgConfigLibs = "";
+			let hasAppIndicator = false;
+			let pipewireCflags = "";
+			let hasWaylandScreenCapture = false;
+
+			try {
+				// Try to get flags for all packages
+				const cflagsResult =
+					await $`pkg-config --cflags webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
+				pkgConfigCflags = cflagsResult.stdout.toString().trim();
+				const libsResult =
+					await $`pkg-config --libs webkit2gtk-4.1 gtk+-3.0 ayatana-appindicator3-0.1`.quiet();
+				pkgConfigLibs = libsResult.stdout.toString().trim();
+				hasAppIndicator = true;
+				console.log("Successfully retrieved pkg-config flags");
+			} catch {
+				// If that fails, try without ayatana-appindicator3
+				try {
+					const cflagsResult =
+						await $`pkg-config --cflags webkit2gtk-4.1 gtk+-3.0`.quiet();
+					pkgConfigCflags = cflagsResult.stdout.toString().trim();
+					const libsResult =
+						await $`pkg-config --libs webkit2gtk-4.1 gtk+-3.0`.quiet();
+					pkgConfigLibs = libsResult.stdout.toString().trim();
+					console.warn("⚠️  Using pkg-config without ayatana-appindicator3-0.1");
+					console.log("   cflags:", pkgConfigCflags.substring(0, 100) + "...");
+				} catch (error) {
+					// Fallback to manual flags if pkg-config fails entirely
+					console.warn("⚠️  pkg-config failed, using fallback flags");
+					console.warn("   Error:", error);
+					// Detect architecture for correct glib path
+					const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+					pkgConfigCflags = `-I/usr/include/gtk-3.0 -I/usr/include/webkit2gtk-4.1 -I/usr/include/glib-2.0 -I/usr/lib/${arch}-linux-gnu/glib-2.0/include -I/usr/include/pango-1.0 -I/usr/include/cairo -I/usr/include/gdk-pixbuf-2.0 -I/usr/include/atk-1.0`;
+					pkgConfigLibs = "-lgtk-3 -lwebkit2gtk-4.1 -lglib-2.0 -lgobject-2.0";
+				}
+			}
+
+			try {
+				const cflagsResult =
+					await $`pkg-config --cflags libpipewire-0.3`.quiet();
+				pipewireCflags = cflagsResult.stdout.toString().trim();
+				hasWaylandScreenCapture = true;
+				console.log("Wayland screen capture enabled via PipeWire");
+			} catch {
+				console.warn(
+					"⚠️  Wayland screen capture disabled: PipeWire development headers not found",
+				);
+			}
+
+			// Compile the main wrapper with WebKitGTK, AppIndicator, and CEF headers
+			await $`mkdir -p src/native/linux/build`;
+			console.log(
+				"Compiling with flags:",
+				pkgConfigCflags ? "pkg-config flags present" : "NO FLAGS!",
+			);
+
+			// Build the complete g++ command as an array to avoid shell interpolation issues
+			const compileFlags = [
+				"-std=c++20",
+				"-fPIC",
+				...pkgConfigCflags.split(/\s+/).filter((f) => f),
+				...pipewireCflags.split(/\s+/).filter((f) => f),
+				`-I${cefInclude}`,
+				...(existsSync(wgpuIncludeDir) ? [`-I${wgpuIncludeDir}`] : []),
+				...(hasAppIndicator ? [] : ["-DNO_APPINDICATOR"]),
+				...(hasWaylandScreenCapture
+					? ["-DELECTROBUN_ENABLE_WAYLAND_SCREEN_CAPTURE"]
+					: []),
+			];
+			writeNativeCompileFlags("linux", compileFlags);
+			const compileCmd = [
+				"g++",
+				"-c",
+				...compileFlags,
+				"-o",
+				"src/native/linux/build/nativeWrapper.o",
+				"src/native/linux/nativeWrapper.cpp",
+			];
+
+			await $`${compileCmd}`;
+
+			const waylandCaptureCompileCmd = [
+				"g++",
+				"-c",
+				...compileFlags,
+				"-o",
+				"src/native/linux/build/wayland_screen_capture.o",
+				"src/native/linux/wayland_screen_capture.cpp",
+			];
+			await $`${waylandCaptureCompileCmd}`;
+
+			const waylandPipeWireCaptureCompileCmd = [
+				"g++",
+				"-c",
+				...compileFlags,
+				"-o",
+				"src/native/linux/build/wayland_pipewire_capture.o",
+				"src/native/linux/wayland_pipewire_capture.cpp",
+			];
+			await $`${waylandPipeWireCaptureCompileCmd}`;
+
+			// Link with WebKitGTK, AppIndicator, and optionally CEF libraries using weak linking
+			await $`mkdir -p src/native/build`;
+
+			// Build both GTK-only and CEF versions for Linux
+			const asarLib = join(process.cwd(), "vendors", "zig-asar", "libasar.so");
+
+			console.log("Building GTK-only version (libNativeWrapper.so)");
+			const linkCmd = [
+				"g++",
+				"-shared",
+				"-o",
+				"src/native/build/libNativeWrapper.so",
+				"src/native/linux/build/nativeWrapper.o",
+				"src/native/linux/build/wayland_screen_capture.o",
+				"src/native/linux/build/wayland_pipewire_capture.o",
+				asarLib,
+				...pkgConfigLibs.split(/\s+/).filter((f) => f),
+				"-ldl",
+				"-lpthread",
+			];
+			await $`${linkCmd}`;
+
+			if (cefLibsExist) {
+				console.log("Compiling CEF loader...");
+				await $`g++ -c -std=c++20 -fPIC -I${cefInclude} -o src/native/linux/build/cef_loader.o src/native/linux/cef_loader.cpp`;
+
+				console.log(
+					"Building CEF version (libNativeWrapper_cef.so) with weak linking",
+				);
+				const linkCefCmd = [
+					"g++",
+					"-shared",
+					"-o",
+					"src/native/build/libNativeWrapper_cef.so",
+					"src/native/linux/build/nativeWrapper.o",
+					"src/native/linux/build/wayland_screen_capture.o",
+					"src/native/linux/build/wayland_pipewire_capture.o",
+					"src/native/linux/build/cef_loader.o",
+					asarLib,
+					...pkgConfigLibs.split(/\s+/).filter((f) => f),
+					"-Wl,--whole-archive",
+					cefWrapperLib,
+					"-Wl,--no-whole-archive",
+					"-ldl",
+					"-lpthread",
+					"-Wl,-rpath,$ORIGIN:$ORIGIN/cef",
+				];
+				await $`${linkCefCmd}`;
+				console.log(
+					"Built both GTK-only and CEF versions for flexible deployment",
+				);
+			} else {
+				console.log("CEF libraries not found - only GTK version built");
+			}
+
+			console.log("Native wrapper built successfully");
+		} catch (error: unknown) {
+			console.log(
+				"Build failed, error details:",
+				error instanceof Error ? error.message : error,
+			);
+			throw error;
+		}
+	}
+}
+
+async function buildLauncher() {
+	console.log(`Building launcher for ${OS} ${ARCH}...`);
+
+	let zigArgs: string[] = [];
+
+	if (OS === "win") {
+		zigArgs = [`-Dtarget=${WINDOWS_TARGET.zig}`, "-Dcpu=baseline"];
+	} else if (OS === "linux") {
+		if (ARCH === "arm64") {
+			zigArgs = ["-Dtarget=aarch64-linux-gnu"];
+		} else {
+			zigArgs = ["-Dtarget=x86_64-linux-gnu"];
+		}
+	} else if (OS === "macos") {
+		zigArgs = [`-Dtarget=${macosZigTarget(ARCH)}`];
+	}
+
+	await runZigBuild("launcher", zigArgs);
+}
+
+async function buildCore() {
+	console.log(`Building ElectrobunCore for ${OS} ${ARCH}...`);
+
+	let zigArgs: string[] = [];
+
+	if (OS === "win") {
+		zigArgs = [`-Dtarget=${WINDOWS_TARGET.zig}`, "-Dcpu=baseline"];
+	} else if (OS === "linux") {
+		if (ARCH === "arm64") {
+			zigArgs = ["-Dtarget=aarch64-linux-gnu"];
+		} else {
+			zigArgs = ["-Dtarget=x86_64-linux-gnu"];
+		}
+	} else if (OS === "macos") {
+		zigArgs = [`-Dtarget=${macosZigTarget(ARCH)}`];
+	}
+
+	await runZigBuild("core", zigArgs);
+}
+
+async function buildMainJs() {
+	const result = await Bun.build({
+		entrypoints: [join("src", "launcher", "main.ts")],
+		outdir: join("dist"),
+		external: [],
+		// minify: true, // todo (yoav): add minify in canary and prod builds
+		target: "bun",
+	});
+
+	// Verify main.js was created
+	const mainJsPath = join("dist", "main.js");
+	if (!existsSync(mainJsPath)) {
+		throw new Error(
+			`main.js was not created at ${mainJsPath}. Build result: ${JSON.stringify(result)}`,
+		);
+	}
+	console.log(`main.js built successfully at ${mainJsPath}`);
+
+	return result;
+}
+
+async function buildSelfExtractor() {
+	const zigArgs =
+		OS === "win"
+			? [`-Dtarget=${WINDOWS_TARGET.zig}`, "-Dcpu=baseline"]
+			: OS === "macos"
+				? [
+						`-Dtarget=${macosZigTarget(ARCH)}`,
+						...(ARCH === "x64" ? ["-Dcpu=baseline"] : []),
+					]
+			: OS === "linux" && ARCH === "arm64"
+				? ["-Dtarget=aarch64-linux-gnu", "-Dcpu=baseline"]
+			: ARCH === "x64"
+				? ["-Dcpu=baseline"]
+				: [];
+
+	await runZigBuild("extractor", zigArgs, "ReleaseFast");
+}
+
+async function buildPreload() {
+	// The preload scripts (drag regions, internal RPC, encryption, webview tags) are written
+	// in TypeScript for maintainability. We pre-compile them here because:
+	// 1. At runtime, the app runs from an ASAR bundle where source .ts files don't exist
+	// 2. Only the bundled JS is shipped, so Bun.build() can't compile at runtime
+	// The compiled outputs are imported by native.ts and injected into webviews.
+	//
+	// Two variants are compiled:
+	// - preloadScript: Full preload for trusted webviews (RPC, encryption, webview tags)
+	// - preloadScriptSandboxed: Minimal preload for sandboxed/untrusted webviews (events only)
+	const preloadDir = join(process.cwd(), "src", "preload");
+	const outputDir = join(preloadDir, ".generated");
+	const outputPath = join(outputDir, "compiled.ts");
+
+	// Ensure output directory exists
+	mkdirSync(outputDir, { recursive: true });
+
+	// Build full preload (trusted webviews)
+	const fullPreloadEntry = join(preloadDir, "index.ts");
+	const fullResult = await Bun.build({
+		entrypoints: [fullPreloadEntry],
+		target: "browser",
+		format: "esm",
+		minify: false,
+	});
+
+	if (!fullResult.success) {
+		console.error("Full preload build failed:", fullResult.logs);
+		throw new Error("Failed to build full preload script");
+	}
+
+	// Build sandboxed preload (untrusted webviews)
+	const sandboxedPreloadEntry = join(preloadDir, "index-sandboxed.ts");
+	const sandboxedResult = await Bun.build({
+		entrypoints: [sandboxedPreloadEntry],
+		target: "browser",
+		format: "esm",
+		minify: false,
+	});
+
+	if (!sandboxedResult.success) {
+		console.error("Sandboxed preload build failed:", sandboxedResult.logs);
+		throw new Error("Failed to build sandboxed preload script");
+	}
+
+	// Wrap in IIFE to prevent top-level variables from leaking into webview global scope
+	// (Bun removed iife format support in 1.3.10, so we build as esm and wrap manually)
+	const fullPreloadJs = `(function(){${await fullResult.outputs[0].text()}})();`;
+	const sandboxedPreloadJs = `(function(){${await sandboxedResult.outputs[0].text()}})();`;
+	const distDir = join(process.cwd(), "dist");
+
+	const outputContent = `// Auto-generated file. Do not edit directly.
+// Run "hutch build.ts" or "hutch run build:dev" from the package folder to regenerate.
+
+// Full preload for trusted webviews (RPC, encryption, drag regions, webview tags)
+export const preloadScript = ${JSON.stringify(fullPreloadJs)};
+
+// Minimal preload for sandboxed/untrusted webviews (lifecycle events only, no RPC)
+export const preloadScriptSandboxed = ${JSON.stringify(sandboxedPreloadJs)};
+`;
+
+	writeFileSync(outputPath, outputContent);
+	mkdirSync(distDir, { recursive: true });
+	writeFileSync(join(distDir, "preload-full.js"), fullPreloadJs);
+	writeFileSync(join(distDir, "preload-sandboxed.js"), sandboxedPreloadJs);
+	console.log("Preload scripts compiled successfully (full + sandboxed)");
+}

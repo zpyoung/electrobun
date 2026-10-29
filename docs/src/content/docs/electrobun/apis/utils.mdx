@@ -428,6 +428,46 @@ err := electrobun.showNotification(core, electrobun.NotificationOptions{
 `title` is required. `subtitle` uses the platform's closest available
 presentation outside macOS.
 
+### Permission, clicks and dismissals
+
+On macOS, the TypeScript SDK can read and request notification permission
+and report when the user clicks or dismisses a notification. `showNotification`
+returns the notification's id. Pass your own `id` to match events to your data;
+showing another notification with the same id replaces the first one.
+
+```ts
+import Electrobun, { Utils } from "electrobun/main";
+
+const permission = await Utils.requestNotificationPermission();
+// "not-determined" | "denied" | "authorized" | "provisional" | "unsupported"
+
+if (permission === "authorized" || permission === "provisional") {
+  Utils.showNotification({ id: "export-42", title: "Export complete" });
+}
+
+Electrobun.events.on("notification-click", (event) => {
+  const { id } = event.data as { id: string };
+  console.log("clicked", id);
+});
+
+Electrobun.events.on("notification-dismiss", (event) => {
+  const { id } = event.data as { id: string };
+  console.log("dismissed", id);
+});
+```
+
+`getNotificationPermission()` reads the current permission without prompting.
+`requestNotificationPermission()` shows the macOS prompt the first time and
+resolves with the stored decision after that.
+
+Both resolve `"unsupported"` on Linux and Windows, and on macOS when the app
+runs without a bundle identifier. In those cases `notification-click` and
+`notification-dismiss` never fire. On macOS the events also need permission:
+without it, Electrobun shows notifications through the older
+`NSUserNotification` API, which reports neither. macOS only delivers these
+events while the app is running, and it may refuse to authorize an unsigned
+build.
+
 ## Clipboard
 
 <Tabs syncKey="runtime">

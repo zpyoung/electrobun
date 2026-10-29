@@ -201,7 +201,10 @@ the callback.
 ## Application events
 
 Current application event names are `application-menu-clicked`,
-`context-menu-clicked`, `open-url`, `reopen`, and `before-quit`.
+`context-menu-clicked`, `open-url`, `reopen`, `before-quit`,
+`notification-click`, and `notification-dismiss`. The notification events
+carry `{ id }` and fire on macOS only; see
+[Notifications](/electrobun/apis/utils/#permission-clicks-and-dismissals).
 
 ```ts
 import Electrobun from "electrobun/main";

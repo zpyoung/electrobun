@@ -635,6 +635,24 @@ const core = (() => {
 				],
 				returns: FFIType.void,
 			},
+			showNotificationWithId: {
+				args: [
+					FFIType.cstring,
+					FFIType.cstring,
+					FFIType.cstring,
+					FFIType.bool,
+					FFIType.cstring,
+				],
+				returns: FFIType.void,
+			},
+			setNotificationHandlers: {
+				args: [FFIType.function, FFIType.function],
+				returns: FFIType.bool,
+			},
+			requestNotificationPermission: {
+				args: [FFIType.u32, FFIType.bool],
+				returns: FFIType.bool,
+			},
 			getAllDisplays: {
 				args: [],
 				returns: FFIType.cstring,
@@ -2375,14 +2393,31 @@ const _ffiImpl = {
 			body?: string;
 			subtitle?: string;
 			silent?: boolean;
+			id: string;
 		}): void => {
-			const { title, body = "", subtitle = "", silent = false } = params;
-			core_.symbols.showNotification(
+			const { title, body = "", subtitle = "", silent = false, id } = params;
+			core_.symbols.showNotificationWithId(
 				toCString(title),
 				toCString(body),
 				toCString(subtitle),
 				silent,
+				toCString(id),
 			);
+		},
+		getNotificationPermission: (params: {
+			prompt: boolean;
+		}): Promise<NotificationPermission> => {
+			return new Promise((resolve) => {
+				const requestId = ++notificationPermissionRequestCounter;
+				notificationPermissionRequests.set(requestId, resolve);
+				if (
+					!notificationEventsSupported ||
+					!core_.symbols.requestNotificationPermission(requestId, params.prompt)
+				) {
+					notificationPermissionRequests.delete(requestId);
+					resolve("unsupported");
+				}
+			});
 		},
 		setDockIconVisible: (params: { visible: boolean }): void => {
 			core_.symbols.setDockIconVisible(params.visible);
@@ -3079,6 +3114,56 @@ if (native) {
 		{ args: [FFIType.cstring], returns: "void", threadsafe: true },
 	);
 	native_.symbols.setGlobalShortcutCallback(globalShortcutCallback);
+}
+
+export type NotificationPermission =
+	| "not-determined"
+	| "denied"
+	| "authorized"
+	| "provisional"
+	| "unsupported";
+
+// Indexed by UNAuthorizationStatus; the native side reports -1 when it can't answer.
+const notificationPermissionByStatus: readonly NotificationPermission[] = [
+	"not-determined",
+	"denied",
+	"authorized",
+	"provisional",
+];
+const notificationPermissionRequests = new Map<
+	number,
+	(permission: NotificationPermission) => void
+>();
+let notificationPermissionRequestCounter = 0;
+let notificationEventsSupported = false;
+
+if (native) {
+	const notificationResponseCallback = new JSCallback(
+		(eventPtr, idPtr) => {
+			const eventName = ffiCStringToString(eventPtr);
+			const id = ffiCStringToString(idPtr);
+			const events = electrobunEventEmitter.events.app;
+			if (eventName === "click") {
+				electrobunEventEmitter.emitEvent(events.notificationClick({ id }));
+			} else if (eventName === "dismiss") {
+				electrobunEventEmitter.emitEvent(events.notificationDismiss({ id }));
+			}
+		},
+		{ args: [FFIType.cstring, FFIType.cstring], returns: "void", threadsafe: true },
+	);
+	const notificationPermissionCallback = new JSCallback(
+		(requestId: number, status: number) => {
+			const resolve = notificationPermissionRequests.get(requestId);
+			if (!resolve) return;
+			notificationPermissionRequests.delete(requestId);
+			resolve(notificationPermissionByStatus[status] ?? "unsupported");
+		},
+		{ args: [FFIType.u32, FFIType.i32], returns: "void", threadsafe: true },
+	);
+	notificationEventsSupported = core_.symbols.setNotificationHandlers(
+		notificationResponseCallback,
+		notificationPermissionCallback,
+	);
 }
 
 // GlobalShortcut module for external use

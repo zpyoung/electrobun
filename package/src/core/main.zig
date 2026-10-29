@@ -113,6 +113,8 @@ const GlobalShortcutHandler = *const fn ([*:0]const u8) callconv(.c) void;
 const QuitRequestedHandler = *const fn () callconv(.c) void;
 const URLOpenHandler = *const fn ([*:0]const u8) callconv(.c) void;
 const AppReopenHandler = *const fn () callconv(.c) void;
+const NotificationResponseHandler = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) void;
+const NotificationPermissionHandler = *const fn (u32, i32) callconv(.c) void;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const WebviewSecretKey = [Aes256Gcm.key_length]u8;
 const websocket_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -4051,6 +4053,51 @@ export fn showNotification(
     const ShowNotificationFn = *const fn ([*:0]const u8, [*:0]const u8, [*:0]const u8, bool) callconv(.c) void;
     const show_notification = lookupNativeSymbol(ShowNotificationFn, "showNotification") orelse return;
     show_notification(title, body, subtitle, silent);
+}
+
+// Platforms without notification ids show the notification without one.
+export fn showNotificationWithId(
+    title: [*:0]const u8,
+    body: [*:0]const u8,
+    subtitle: [*:0]const u8,
+    silent: bool,
+    notification_id: [*:0]const u8,
+) void {
+    const ShowNotificationWithIdFn = *const fn ([*:0]const u8, [*:0]const u8, [*:0]const u8, bool, [*:0]const u8) callconv(.c) void;
+    const show_notification_with_id = lookupOptionalNativeSymbol(
+        ShowNotificationWithIdFn,
+        "showNotificationWithId",
+    ) orelse return showNotification(title, body, subtitle, silent);
+    show_notification_with_id(title, body, subtitle, silent, notification_id);
+}
+
+// Returns false when the platform can't report notification clicks,
+// dismissals or permission.
+export fn setNotificationHandlers(
+    response_handler: ?NotificationResponseHandler,
+    permission_handler: ?NotificationPermissionHandler,
+) bool {
+    clearLastError();
+    const SetNotificationHandlersFn = *const fn (?NotificationResponseHandler, ?NotificationPermissionHandler) callconv(.c) void;
+    const set_notification_handlers = lookupOptionalNativeSymbol(
+        SetNotificationHandlersFn,
+        "setNotificationHandlers",
+    ) orelse return false;
+    set_notification_handlers(response_handler, permission_handler);
+    return true;
+}
+
+// Returns false when the platform can't report notification permission; the
+// permission handler then never receives request_id.
+export fn requestNotificationPermission(request_id: u32, prompt: bool) bool {
+    clearLastError();
+    const RequestNotificationPermissionFn = *const fn (u32, bool) callconv(.c) void;
+    const request_notification_permission = lookupOptionalNativeSymbol(
+        RequestNotificationPermissionFn,
+        "requestNotificationPermission",
+    ) orelse return false;
+    request_notification_permission(request_id, prompt);
+    return true;
 }
 
 export fn setDockIconVisible(visible: bool) void {

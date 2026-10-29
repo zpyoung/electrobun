@@ -1,0 +1,51 @@
+type JsonRecord = Record<string, unknown>;
+
+export type WebviewEventBridgeMessage = {
+	id: number;
+	eventName: string;
+	detail: string;
+};
+
+// Reported by the native wrapper only, so a page can't forge them.
+<<<<<<<
+const NATIVE_ONLY_EVENT_NAMES = new Set(["drop-source-paths"]);
+=======
+const NATIVE_ONLY_EVENT_NAMES = new Set(["load-failed"]);
+>>>>>>>
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseWebviewEventBridgeMessage(
+	sourceId: number,
+	rawMessage: string,
+): WebviewEventBridgeMessage | null {
+	if (!rawMessage.startsWith("{")) return null;
+
+	let message: unknown;
+	try {
+		message = JSON.parse(rawMessage);
+	} catch {
+		return null;
+	}
+	if (
+		!isJsonRecord(message) ||
+		message["id"] !== "webviewEvent" ||
+		message["type"] !== "message" ||
+		!isJsonRecord(message["payload"])
+	) {
+		return null;
+	}
+
+	const { id, eventName, detail } = message["payload"];
+	if (
+		id !== sourceId ||
+		typeof eventName !== "string" ||
+		typeof detail !== "string" ||
+		NATIVE_ONLY_EVENT_NAMES.has(eventName)
+	) {
+		return null;
+	}
+	return { id: sourceId, eventName, detail };
+}

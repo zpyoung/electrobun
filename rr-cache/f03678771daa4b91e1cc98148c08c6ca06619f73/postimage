@@ -1,0 +1,66 @@
+import { describe, expect, it } from "bun:test";
+import { parseWebviewEventBridgeMessage } from "./eventBridge";
+
+const eventMessage = (id: number, detail = '{"message":"hello"}') =>
+	JSON.stringify({
+		id: "webviewEvent",
+		type: "message",
+		payload: { id, eventName: "host-message", detail },
+	});
+
+describe("parseWebviewEventBridgeMessage", () => {
+	it("accepts the matching native sender id", () => {
+		expect(parseWebviewEventBridgeMessage(17, eventMessage(17))).toEqual({
+			id: 17,
+			eventName: "host-message",
+			detail: '{"message":"hello"}',
+		});
+	});
+
+	it("rejects spoofed and malformed payloads", () => {
+		expect(parseWebviewEventBridgeMessage(17, eventMessage(99))).toBeNull();
+		expect(parseWebviewEventBridgeMessage(1, "[]")).toBeNull();
+		expect(parseWebviewEventBridgeMessage(1, "{not-json")).toBeNull();
+		expect(
+			parseWebviewEventBridgeMessage(
+				1,
+				'{"id":"webviewEvent","type":"message","payload":{"id":1,"eventName":"host-message"}}',
+			),
+		).toBeNull();
+	});
+
+	it("rejects events only the native wrapper may report", () => {
+		const forged = JSON.stringify({
+			id: "webviewEvent",
+			type: "message",
+			payload: {
+				id: 4,
+				eventName: "drop-source-paths",
+				detail: '{"paths":["/etc/passwd"]}',
+			},
+		});
+		expect(parseWebviewEventBridgeMessage(4, forged)).toBeNull();
+	});
+
+	it("refuses native-only events sent by a page", () => {
+		expect(
+			parseWebviewEventBridgeMessage(
+				5,
+				JSON.stringify({
+					id: "webviewEvent",
+					type: "message",
+					payload: { id: 5, eventName: "load-failed", detail: "{}" },
+				}),
+			),
+		).toBeNull();
+	});
+
+	it("keeps hostile detail as inert string data", () => {
+		const detail = 'null); globalThis.pwned = "yes"; //';
+		expect(parseWebviewEventBridgeMessage(4, eventMessage(4, detail))).toEqual({
+			id: 4,
+			eventName: "host-message",
+			detail,
+		});
+	});
+});

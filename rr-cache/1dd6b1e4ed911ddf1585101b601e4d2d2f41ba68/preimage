@@ -1,0 +1,1035 @@
+name: Build and Release
+
+concurrency:
+  group: electrobun-release
+  cancel-in-progress: false
+  queue: max
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.0.19 or v0.0.19-beta.1)'
+        required: true
+      prerelease:
+        description: 'Assert that the tag is a pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-vm:
+    uses: ./.github/workflows/test-vm.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            platform_name: darwin
+            artifact_platform: macos
+          - os: macos-26-intel
+            platform: darwin
+            arch: x64
+            platform_name: darwin
+            artifact_platform: macos
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x64
+            platform_name: linux
+            artifact_platform: linux
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            platform_name: linux
+            artifact_platform: linux
+          - os: windows-2025
+            platform: win32
+            arch: x64
+            platform_name: win
+            artifact_platform: win
+          # Use the native ARM64 compiler and exercise both native ARM64 and
+          # emulated x64 synchronization on this runner.
+          - os: windows-11-arm
+            platform: win32
+            arch: arm64
+            platform_name: win
+            artifact_platform: win
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      ELECTROBUN_BUILD_ARCH: ${{ matrix.arch }}
+      EXPECTED_HUTCH_VERSION: '0.28.2'
+      # Track the compiled pair explicitly; the published template catalog must match it.
+      EXPECTED_PAIRED_COTTONTAIL_VERSION: '0.7.3'
+      EXPECTED_COTTONTAIL_VERSION: '0.7.3'
+      EXPECTED_APP_COTTONTAIL_VERSION: '0.7.3'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Log disk space (job start)
+        shell: bash
+        run: |
+          echo "Runner OS: $RUNNER_OS"
+          df -h /
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+          cache: npm
+          cache-dependency-path: package/package-lock.json
+
+      - name: Verify native macOS runner architecture
+        if: matrix.platform == 'darwin'
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          expected_machine=x86_64
+          if [[ "$EXPECTED_ARCH" == arm64 ]]; then expected_machine=arm64; fi
+          test "$(uname -m)" = "$expected_machine"
+          test "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1
+          node -e 'if (process.arch !== process.env.EXPECTED_ARCH) throw new Error(`Expected native ${process.env.EXPECTED_ARCH} Node, got ${process.arch}`)'
+
+      - name: Verify release tag and version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: package/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+
+      - name: Log disk space (job start - Windows)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+
+      - name: Install Hutch
+        uses: ./.github/actions/install-hutch
+        with:
+          channel: ${{ contains(env.EXPECTED_HUTCH_VERSION, '-') && 'canary' || 'production' }}
+
+      - name: Verify template toolchain compatibility
+        run: node package/scripts/verify-release-toolchain.mjs --template-pairing
+
+      - name: Install dependencies
+        run: hutch run install
+        working-directory: package
+
+      - name: Test npm bootstrap and release tooling
+        run: hutch test:npm-bootstrap
+        working-directory: package
+
+      - name: Test complete-platform CEF version selection
+        run: node --test package/scripts/cef-release-index.test.mjs package/scripts/audit-cef-certificate-revocation.test.mjs
+
+      - name: Test macOS docked Web Inspector layout
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-inspector-layout
+        working-directory: package
+
+      - name: Test spell-check ownership contract
+        run: hutch test:spell-check
+        working-directory: package
+
+      - name: Exercise macOS WKWebView spell checking
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-spell-check
+        working-directory: package
+
+<<<<<<<
+      - name: Test drop source paths contract
+        run: hutch test:drop-source-paths
+        working-directory: package
+
+      - name: Exercise macOS WKWebView drop source paths
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-drop-source-paths
+        working-directory: package
+
+      - name: Test native page request contract
+        run: hutch test:native-requests
+        working-directory: package
+
+      - name: Exercise macOS WKWebView native page requests
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-native-requests
+        working-directory: package
+
+      - name: Test isolated preview contract
+        run: hutch test:isolated-preview
+        working-directory: package
+
+      - name: Exercise macOS isolated preview fences
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-isolated-preview
+=======
+      - name: Test user-agent contract
+        run: hutch test:user-agent
+        working-directory: package
+
+      - name: Exercise macOS WKWebView user agents
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-user-agent
+>>>>>>>
+        working-directory: package
+
+      - name: Setup MSVC Developer Command Prompt
+        if: matrix.platform == 'win32'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Free disk space (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          # Remove large preinstalled software we don't need
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Free disk space (macOS)
+        if: matrix.platform == 'darwin'
+        shell: bash
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          # Keep the selected Xcode, but remove the other full Xcode installs
+          # preloaded on GitHub's macOS image. Kitchen only needs the selected
+          # macOS SDK and its multiple signed bundles otherwise exhaust the
+          # runner disk while hdiutil creates the final image.
+          selected_xcode_root="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          case "$selected_xcode_root" in
+            /Applications/Xcode*.app) ;;
+            *)
+              echo "Refusing to remove Xcode installs: unexpected selected Xcode root: $selected_xcode_root" >&2
+              exit 1
+              ;;
+          esac
+          echo "Preserving selected Xcode: $selected_xcode_root"
+          for xcode_root in /Applications/Xcode_*.app; do
+            [[ -d "$xcode_root" && ! -L "$xcode_root" ]] || continue
+            resolved_xcode_root="$(cd "$xcode_root" && pwd -P)"
+            case "$resolved_xcode_root" in
+              /Applications/Xcode_*.app) ;;
+              *)
+                echo "Refusing to remove unexpected Xcode root: $resolved_xcode_root" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$resolved_xcode_root" != "$selected_xcode_root" ]]; then
+              echo "Removing unused Xcode: $resolved_xcode_root"
+              sudo rm -rf "$resolved_xcode_root"
+            fi
+          done
+          # Remove Xcode caches and simulators to free space.
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "$HOME/Library/Developer/Xcode/Archives" || true
+          rm -rf "$HOME/Library/Developer/Xcode/iOS DeviceSupport" || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes || true
+          # Clear common caches.
+          rm -rf "$HOME/Library/Caches" || true
+          rm -rf "$HOME/Library/Logs" || true
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libpipewire-0.3-dev \
+            build-essential \
+            cmake \
+            pkg-config
+
+      - name: Test portable CEF find behavior
+        run: node scripts/run-bun-test.js src/shared/cef-find-session.test.ts
+        working-directory: package
+
+      - name: Test cross-platform native symbol contracts
+        if: matrix.platform == 'linux' && matrix.arch == 'x64'
+        run: hutch test:native-symbol-contract
+        working-directory: package
+
+      - name: Get CEF version for cache key
+        id: cef-version
+        shell: bash
+        run: |
+          CEF_VER=$(grep "const CEF_VERSION " package/src/shared/cef-version.ts | head -1 | sed "s/.*\`\(.*\)\`.*/\1/" | tr '+' '-')
+          echo "version=$CEF_VER" >> $GITHUB_OUTPUT
+
+      - name: Cache CEF vendor directory
+        uses: actions/cache@v5
+        with:
+          path: package/vendors/cef
+          key: cef-${{ matrix.platform_name }}-${{ matrix.arch }}-${{ steps.cef-version.outputs.version }}
+
+      - name: Cache core build dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            package/vendors/zig
+            package/vendors/zig-asar
+            package/vendors/zig-bsdiff
+            package/vendors/zig-zstd
+            package/vendors/wgpu
+          key: core-build-dependencies-${{ matrix.platform_name }}-${{ matrix.arch }}-${{ hashFiles('package/src/shared/build-dependencies.ts') }}
+
+      - name: Cache process_helper binary
+        uses: actions/cache@v5
+        with:
+          path: |
+            package/src/native/build/process_helper
+            package/src/native/build/process_helper.exe
+          key: process-helper-${{ matrix.platform_name }}-${{ matrix.arch }}-${{ steps.cef-version.outputs.version }}-${{ hashFiles('package/src/native/**/cef_process_helper_*', 'package/scripts/macos-release.js') }}
+
+      - name: Build for ${{ matrix.platform_name }}-${{ matrix.arch }}
+        run: node scripts/package-release.js
+        working-directory: package
+
+      - name: Test host WebView delivery and RPC backpressure
+        run: node scripts/run-bun-test.js src/shared/rpc.test.ts src/shared/windows-unicode-ui.test.ts src/sdks/main/core/BrowserViewHostMessageQueue.test.ts
+        working-directory: package
+
+      - name: Prepare pinned compilers for callback isolation tests
+        run: hutch build.ts --vendor-rust-only --vendor-go-only
+        working-directory: package
+
+      - name: Test Rust Kitchen callback isolation
+        run: node scripts/test-rust-webview-observations.mjs
+        working-directory: kitchen
+
+      - name: Test Go Kitchen callback isolation
+        run: node scripts/test-go-webview-observations.mjs
+        working-directory: kitchen
+
+      - name: Test Zig Kitchen callback isolation
+        run: node scripts/test-zig-webview-observations.mjs
+        working-directory: kitchen
+
+      - name: Test Windows release validation contract
+        if: matrix.platform == 'win32'
+        run: node --test scripts/windows-release-validation.test.mjs scripts/webview2-runtime.test.mjs scripts/windows-msvc-environment.test.mjs scripts/updater-lifecycle-target.test.mjs
+        working-directory: package
+
+      - name: Test Windows profile paths and WebView2 teardown
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        working-directory: package
+        run: |
+          node scripts/test-windows-profile-paths.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Windows profile path tests failed" }
+          node scripts/run-bun-test.js src/shared/windows-webview2-lifecycle.test.ts src/shared/windows-webview2-initialization.test.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows WebView2 lifecycle tests failed" }
+          node scripts/test-windows-webview2-window.mjs --install-missing-runtime
+          if ($LASTEXITCODE -ne 0) { throw "Windows WebView2 controller ownership tests failed" }
+          node scripts/run-bun-test.js ../kitchen/src/tests/webview2-initialization-state.test.ts ../kitchen/src/tests/webview2-stacking-state.test.ts
+          if ($LASTEXITCODE -ne 0) { throw "Windows WebView2 presentation assertion tests failed" }
+
+      - name: Test Windows release launcher identity and full exit status
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        working-directory: package
+        env:
+          ELECTROBUN_REQUIRE_TEST_LAUNCHER: '1'
+        run: |
+          $env:ELECTROBUN_TEST_LAUNCHER = (Resolve-Path .\dist\launcher.exe).Path
+          node --test src/launcher/windows_process_identity.integration.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Windows release launcher identity tests failed" }
+
+      - name: Test Windows native Threaded startup and shutdown
+        if: matrix.platform == 'win32'
+        timeout-minutes: 12
+        run: node scripts/test-windows-threaded-shutdown.mjs
+        working-directory: package
+
+      - name: Test core synchronization under contention
+        timeout-minutes: 15
+        run: node scripts/core-synchronization-stress.mjs
+        working-directory: package
+
+      - name: Test CEF remote debugging policy
+        run: hutch test:cef-debug
+        working-directory: package
+
+      - name: Test Linux native file dialog
+        if: matrix.platform == 'linux' && matrix.arch == 'x64'
+        run: hutch test:linux-native-dialog
+        working-directory: package
+
+      - name: Upload core artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: electrobun-core-${{ matrix.platform_name }}-${{ matrix.arch }}
+          path: package/electrobun-core-${{ matrix.platform_name }}-${{ matrix.arch }}.tar.gz
+
+      - name: Upload CEF artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: electrobun-cef-${{ matrix.platform_name }}-${{ matrix.arch }}
+          path: package/electrobun-cef-${{ matrix.platform_name }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: ignore
+
+      - name: Clean up after artifact upload
+        shell: bash
+        run: |
+          echo "Disk space before cleanup:"
+          df -h . || true
+          # Remove uploaded tar.gz files
+          rm -f package/*.tar.gz
+          # Remove CEF vendors (very large)
+          rm -rf package/vendors/cef
+          # Remove build intermediates
+          rm -rf package/build
+          echo "Disk space after cleanup:"
+          df -h . || true
+
+      - name: Install Apple Certificate
+        if: matrix.platform == 'darwin'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          security delete-keychain build.keychain || true
+          echo $MACOS_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | sed s/\"//g)
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P $MACOS_CERTIFICATE_PWD -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning build.keychain
+          rm certificate.p12
+
+      - name: Install Kitchen dependencies
+        run: hutch run install
+        working-directory: kitchen
+
+      - name: Typecheck Kitchen against local devkit
+        run: |
+          hutch electrobun prepare
+          node ../package/node_modules/typescript/bin/tsc --noEmit
+        working-directory: kitchen
+        env:
+          HUTCH_ELECTROBUN_DEVKIT_ROOT: ${{ github.workspace }}/package/dist
+
+      - name: Test Kitchen AUTO_RUN exit propagation
+        if: ${{ !cancelled() }}
+        run: node ../package/scripts/run-bun-test.js src/test-framework/auto-run-exit.test.ts
+        working-directory: kitchen
+
+      - name: Test Kitchen renderer requirements
+        if: ${{ !cancelled() }}
+        run: node ../package/scripts/run-bun-test.js src/test-framework/requirements.test.ts
+        working-directory: kitchen
+
+      - name: Test Kitchen result summary
+        if: ${{ !cancelled() }}
+        run: node ../package/scripts/run-bun-test.js src/test-runner/test-summary.test.ts
+        working-directory: kitchen
+
+      - name: Test Kitchen quit exit codes
+        if: ${{ !cancelled() }}
+        run: node ../package/scripts/run-bun-test.js ../package/src/sdks/main/__tests__/utils-quit-exit-code.test.ts
+        working-directory: kitchen
+
+      - name: Test release toolchain provenance contract
+        run: node --test ../package/scripts/verify-release-toolchain.test.mjs
+        working-directory: kitchen
+
+      - name: Verify pinned Hutch and Cottontail provenance
+        run: node ../package/scripts/verify-release-toolchain.mjs
+        working-directory: kitchen
+
+      - name: Build Kitchen
+        run: hutch electrobun build --env=${{ steps.release-type.outputs.env }}
+        working-directory: kitchen
+        env:
+          HUTCH_ELECTROBUN_DEVKIT_ROOT: ${{ github.workspace }}/package/dist
+          ELECTROBUN_DEVELOPER_ID: ${{ matrix.platform == 'darwin' && secrets.ELECTROBUN_DEVELOPER_ID || '' }}
+          ELECTROBUN_APPLEID: ${{ matrix.platform == 'darwin' && secrets.ELECTROBUN_APPLEID || '' }}
+          ELECTROBUN_APPLEIDPASS: ${{ matrix.platform == 'darwin' && secrets.ELECTROBUN_APPLEIDPASS || '' }}
+          ELECTROBUN_TEAMID: ${{ matrix.platform == 'darwin' && secrets.ELECTROBUN_TEAMID || '' }}
+
+      - name: Validate Kitchen artifacts
+        run: >-
+          hutch scripts/validate-kitchen-artifacts.ts
+          kitchen/artifacts
+          ${{ steps.release-type.outputs.env }}
+          ${{ matrix.artifact_platform }}
+          ${{ matrix.arch }}
+          ${{ steps.release-type.outputs.version }}
+
+      - name: Stage Kitchen artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitchen-${{ matrix.artifact_platform }}-${{ matrix.arch }}
+          path: kitchen/artifacts/*
+          if-no-files-found: error
+
+      - name: Clean up kitchen artifacts
+        shell: bash
+        run: |
+          rm -rf kitchen/artifacts
+          rm -rf kitchen/build
+
+  release:
+    needs: [build, test-vm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - name: Verify release tag and version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: package/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+
+      - name: Verify release notes configuration
+        run: node package/scripts/release-notes-contract.test.mjs
+
+      - name: Verify release publishers
+        run: >-
+          node --test
+          package/scripts/create-artifact-index.test.mjs
+          package/scripts/release-publication-contract.test.mjs
+          package/scripts/verify-release-assets.test.mjs
+          npm/scripts/accept-published-bootstrap.test.mjs
+          npm/scripts/stage-hutch-release-artifacts.test.mjs
+
+      - name: Set up Node for npm integrity
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+
+      - name: Preflight npm channel monotonicity
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: npm/electrobun/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+          NPM_DIST_TAG: ${{ steps.release-type.outputs.dist-tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_state="$(mktemp)"
+          trap 'rm -f -- "$npm_state"' EXIT
+          node package/scripts/verify-release-version.mjs
+          node npm/scripts/check-published-bootstrap.mjs \
+            --manifest npm/electrobun/package.json \
+            --tag "$NPM_DIST_TAG" \
+            --output "$npm_state"
+          grep -Eq '^exists=(true|false)$' "$npm_state"
+
+      - name: Download Electrobun release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: electrobun-*
+          path: artifacts
+
+      - name: Stage paired Hutch archives for the Electrobun release
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: >-
+          node npm/scripts/stage-hutch-release-artifacts.mjs
+          --output artifacts/hutch
+          --repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+
+      - name: Create immutable Electrobun artifact index
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: >-
+          node package/scripts/create-artifact-index.mjs
+          --artifacts artifacts
+          --output artifacts/electrobun-artifacts.json
+          --repository "$GITHUB_REPOSITORY"
+          --tag "$RELEASE_TAG"
+          --expect macos-arm64,macos-x64,linux-arm64,linux-x64,windows-x64,windows-arm64
+
+      - name: Reuse or prepare a draft Electrobun release
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          EXPECTED_PRERELEASE: ${{ steps.release-type.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_probe="$(mktemp)"
+          release_metadata="$(mktemp)"
+          asset_ids="$(mktemp)"
+          existing_assets="$(mktemp -d)"
+          cleanup() {
+            rm -f -- "$release_probe" "$release_metadata" "$asset_ids"
+            rm -rf -- "$existing_assets"
+          }
+          trap cleanup EXIT
+
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,databaseId,isDraft,isPrerelease,assets \
+            >"$release_metadata" 2>"$release_probe"; then
+            if grep -Eqi 'HTTP 404|release not found' "$release_probe"; then
+              echo "upload=true" >> "$GITHUB_OUTPUT"
+              echo "No release exists for $RELEASE_TAG; a draft will be created."
+              exit 0
+            fi
+            cat "$release_probe" >&2
+            exit 1
+          fi
+
+          actual_tag="$(jq -r '.tagName' "$release_metadata")"
+          release_id="$(jq -r '.databaseId' "$release_metadata")"
+          is_draft="$(jq -r '.isDraft' "$release_metadata")"
+          is_prerelease="$(jq -r '.isPrerelease' "$release_metadata")"
+          asset_count="$(jq -r '.assets | length' "$release_metadata")"
+          if [[ "$actual_tag" != "$RELEASE_TAG" || ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Release metadata does not match $RELEASE_TAG." >&2
+            cat "$release_metadata" >&2
+            exit 1
+          fi
+
+          if [[ "$is_draft" == "false" ]]; then
+            if [[ "$is_prerelease" != "$EXPECTED_PRERELEASE" || "$asset_count" == "0" ]]; then
+              echo "Public release $RELEASE_TAG has mismatched metadata or no assets; refusing to mutate it." >&2
+              echo "Delete the public release manually or publish a new version before retrying." >&2
+              exit 1
+            fi
+            if ! gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$existing_assets"; then
+              echo "Could not download the existing public release; refusing to mutate it after a transport failure." >&2
+              exit 1
+            fi
+            if node package/scripts/verify-release-assets.mjs \
+              --actual "$existing_assets" \
+              --repository "$GITHUB_REPOSITORY" \
+              --tag "$RELEASE_TAG"; then
+              echo "upload=false" >> "$GITHUB_OUTPUT"
+              echo "Release $RELEASE_TAG is public, complete, and self-consistent; reusing it."
+              exit 0
+            fi
+            echo "Public release $RELEASE_TAG is incomplete or inconsistent; refusing to mutate it." >&2
+            echo "Delete the public release manually or publish a new version before retrying." >&2
+            exit 1
+          fi
+          if [[ "$is_draft" != "true" ]]; then
+            echo "Release $RELEASE_TAG has an invalid draft state: $is_draft" >&2
+            exit 1
+          fi
+
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=true \
+            --prerelease="$EXPECTED_PRERELEASE"
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            >"$release_metadata"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --argjson prerelease "$EXPECTED_PRERELEASE" \
+            '.tagName == $tag and .isDraft == true and .isPrerelease == $prerelease' \
+            "$release_metadata" >/dev/null
+
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets" \
+            --jq '.[].id' >"$asset_ids"
+          while IFS= read -r asset_id; do
+            [[ -z "$asset_id" ]] || gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done <"$asset_ids"
+          echo "upload=true" >> "$GITHUB_OUTPUT"
+          echo "Draft $RELEASE_TAG is ready for a clean asset upload."
+
+      - name: Create or refresh draft Release
+        if: steps.release-state.outputs.upload == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/electrobun-artifacts.json
+            artifacts/hutch/hutch-artifacts.json
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ steps.release-type.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Verify staged draft release
+        if: steps.release-state.outputs.upload == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          EXPECTED_PRERELEASE: ${{ steps.release-type.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_metadata="$(mktemp)"
+          staged_assets="$(mktemp -d)"
+          cleanup() {
+            rm -f -- "$release_metadata"
+            rm -rf -- "$staged_assets"
+          }
+          trap cleanup EXIT
+
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            >"$release_metadata"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --argjson prerelease "$EXPECTED_PRERELEASE" \
+            '.tagName == $tag and .isDraft == true and .isPrerelease == $prerelease' \
+            "$release_metadata" >/dev/null
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$staged_assets"
+          node package/scripts/verify-release-assets.mjs \
+            --actual "$staged_assets" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG"
+
+      - name: Finalize verified draft release
+        if: steps.release-state.outputs.upload == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          EXPECTED_PRERELEASE: ${{ steps.release-type.outputs.prerelease }}
+        shell: bash
+        run: >-
+          gh release edit "$RELEASE_TAG"
+          --repo "$GITHUB_REPOSITORY"
+          --draft=false
+          --prerelease="$EXPECTED_PRERELEASE"
+
+      - name: Require a complete public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          EXPECTED_PRERELEASE: ${{ steps.release-type.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_metadata="$(mktemp)"
+          trap 'rm -f -- "$release_metadata"' EXIT
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease \
+            >"$release_metadata"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --argjson prerelease "$EXPECTED_PRERELEASE" \
+            '.tagName == $tag and .isDraft == false and .isPrerelease == $prerelease' \
+            "$release_metadata" >/dev/null
+
+  npm-publish:
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify matching npm bootstrap version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: npm/electrobun/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+
+      - name: Test and inspect npm bootstrap
+        working-directory: npm/electrobun
+        run: |
+          node --test test/bootstrap.test.mjs test/package.test.mjs ../scripts/accept-published-bootstrap.test.mjs ../scripts/check-published-bootstrap.test.mjs
+          npm pack --dry-run --ignore-scripts
+
+      - name: Check existing npm bootstrap
+        id: npm-state
+        run: >-
+          node npm/scripts/check-published-bootstrap.mjs
+          --manifest npm/electrobun/package.json
+          --tag "${{ steps.release-type.outputs.dist-tag }}"
+          --output "$GITHUB_OUTPUT"
+
+      - name: Publish npm bootstrap
+        if: steps.npm-state.outputs.exists != 'true'
+        working-directory: npm/electrobun
+        run: npm publish --access public --tag "${{ steps.release-type.outputs.dist-tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify published npm bootstrap
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          published_state="$(mktemp)"
+          trap 'rm -f -- "$published_state"' EXIT
+          max_attempts=19
+          for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
+            : > "$published_state"
+            if node npm/scripts/check-published-bootstrap.mjs \
+              --manifest npm/electrobun/package.json \
+              --tag "${{ steps.release-type.outputs.dist-tag }}" \
+              --output "$published_state" &&
+              grep -Fxq 'exists=true' "$published_state"; then
+              echo "Verified the exact npm bootstrap on attempt $attempt."
+              exit 0
+            fi
+            if (( attempt == max_attempts )); then
+              echo "::error::npm did not converge on the exact published bootstrap after $max_attempts attempts." >&2
+              exit 1
+            fi
+            echo "npm has not converged on the exact bootstrap yet; retrying in 10 seconds ($attempt/$max_attempts)." >&2
+            sleep 10
+          done
+
+  npm-acceptance:
+    needs: [npm-publish]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-arm64
+          - os: macos-26-intel
+            platform: macos-x64
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: windows-x64
+          - os: windows-11-arm
+            platform: windows-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify exact published npm acceptance version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: npm/electrobun/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+
+      - name: Accept public single-package npm bootstrap on ${{ matrix.platform }}
+        run: >-
+          node npm/scripts/accept-published-bootstrap.mjs
+          --version "${{ steps.release-type.outputs.version }}"
+          --release-tag "${{ github.event.inputs.tag || github.ref_name }}"
+          --dist-tag "${{ steps.release-type.outputs.dist-tag }}"
+          --repository "${{ github.repository }}"
+          --platform "${{ matrix.platform }}"
+
+  publish-templates:
+    needs: [npm-acceptance]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+
+      - name: Verify matching npm bootstrap version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: npm/electrobun/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+
+      - name: Download Kitchen artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: kitchen-*
+          path: kitchen-artifacts
+          merge-multiple: true
+
+      - name: Install Hutch
+        uses: ./.github/actions/install-hutch
+        with:
+          channel: canary
+
+      - name: Recheck npm channel before mutable publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          published_state="$(mktemp)"
+          trap 'rm -f -- "$published_state"' EXIT
+          node npm/scripts/check-published-bootstrap.mjs \
+            --manifest npm/electrobun/package.json \
+            --tag "${{ steps.release-type.outputs.dist-tag }}" \
+            --output "$published_state"
+          grep -Fxq 'exists=true' "$published_state"
+
+      - name: Validate template publisher
+        run: node --test scripts/publish-templates.test.mjs
+
+      - name: Validate Kitchen uploader
+        working-directory: package
+        run: hutch test ../scripts/upload-kitchen-artifacts.test.ts
+
+      - name: Publish Kitchen artifacts to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: hutch scripts/upload-kitchen-artifacts.ts kitchen-artifacts
+
+      - name: Publish latest template channel to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node scripts/publish-templates.mjs
+
+  desktop-smoke:
+    # Use the public install path only after both npm and the template catalog
+    # have been published. Existing acceptance checks still run independently.
+    needs: [npm-publish, publish-templates]
+    uses: ./.github/workflows/desktop-smoke.yml
+    with:
+      version: ${{ github.event.inputs.tag || github.ref_name }}
+
+  template-acceptance:
+    needs: [publish-templates]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Intel desktop validation uses macOS 15 because stock Cocoa fullscreen
+        # also fails on the hosted macOS 26 Intel image (IconServices).
+        # Related runner graphics issue:
+        # https://github.com/actions/runner-images/issues/14751
+        include:
+          - os: macos-14
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: windows-x64
+          - os: windows-11-arm
+            platform: windows-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.22.1'
+      - name: Verify template acceptance version
+        id: release-type
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_PACKAGE_JSON: package/package.json
+          EXPLICIT_PRERELEASE: ${{ github.event.inputs.prerelease || 'false' }}
+        run: node package/scripts/verify-release-version.mjs
+      - name: Test template acceptance harness
+        run: node --test scripts/accept-published-template.test.mjs
+      - name: Install Linux webview and virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 xvfb xauth
+      - name: Accept published templates on Linux
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+        run: >-
+          xvfb-run -a node scripts/accept-published-template.mjs
+          --version "${{ steps.release-type.outputs.version }}"
+          --platform "${{ matrix.platform }}"
+          --hutch-source "${{ steps.release-type.outputs.prerelease == 'false' && 'production-installer' || 'npm' }}"
+          --output template-acceptance-results
+      - name: Accept published templates on desktop
+        if: runner.os != 'Linux'
+        run: >-
+          node scripts/accept-published-template.mjs
+          --version "${{ steps.release-type.outputs.version }}"
+          --platform "${{ matrix.platform }}"
+          --hutch-source "${{ steps.release-type.outputs.prerelease == 'false' && 'production-installer' || 'npm' }}"
+          --output template-acceptance-results
+      - name: Retain template acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: template-acceptance-${{ matrix.platform }}
+          path: |
+            template-acceptance-results/*.log
+            template-acceptance-results/*.json
+          if-no-files-found: warn

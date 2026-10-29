@@ -6,3 +6,4 @@ patch/hard-reload-load-failed cd package && scripts/test-macos-webview-navigatio
 patch/webview-native-events node --test package/src/shared/native-requests.test.js && package/scripts/test-macos-native-requests.sh
 patch/storage-clear-completion cd package && node scripts/run-bun-test.js src/sdks/main/__tests__/session-storage.test.ts src/shared/native-symbol-contract.test.ts && scripts/test-macos-website-data-store.sh
 patch/isolated-preview-view cd package && node --test src/shared/isolated-preview.test.js && scripts/test-macos-isolated-preview.sh && node scripts/run-bun-test.js src/shared/native-symbol-contract.test.ts
+patch/webview-user-agent cd package && node --test src/shared/user-agent.test.js && scripts/test-macos-user-agent.sh

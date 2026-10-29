@@ -25,6 +25,8 @@ The proxy is a property of the data store, and a non-`persist:` partition gives 
 
 I checked the routing outside Electrobun with a WKWebView on an ephemeral store pointed at a small Bun proxy. Page loads, a script subresource and a WebSocket to `feature-x.localhost` all arrived at the proxy as `CONNECT` and reached the mapped port. WebKit doesn't bypass the proxy for `*.localhost`. With `matchDomains: ["localhost"]`, `example.com` loaded directly. Setting the proxy after the view was created also worked.
 
+In a bundled app, App Transport Security still applies to the URL. A proxy doesn't change that, so plain-http names other than `localhost` and IP addresses need an `NSExceptionDomains` entry. The docs say so, because without the entry the load fails before the proxy is ever contacted.
+
 The native library now links `Network.framework`. The calls sit behind `@available(macOS 14.0, *)`, so the deployment target doesn't change. On older macOS, `Session.supportsProxy` is `false`.
 
 ## Linux and Windows

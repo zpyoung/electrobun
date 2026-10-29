@@ -13053,6 +13053,18 @@ ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionIdentifier, 
     });
 }
 
+// Session proxies are not implemented for WebKitGTK or CEF on Linux yet.
+// Report it so Session.setProxy() can fail loudly instead of ignoring the call.
+ELECTROBUN_EXPORT bool sessionSupportsProxy() {
+    return false;
+}
+
+ELECTROBUN_EXPORT bool sessionSetProxy(const char* partitionIdentifier, const char* proxyJson) {
+    (void)partitionIdentifier;
+    (void)proxyJson;
+    return false;
+}
+
 ELECTROBUN_EXPORT void setURLOpenHandler(void (*callback)(const char*)) {
     (void)callback;
     // Not supported on Linux - stub to prevent dlopen failure

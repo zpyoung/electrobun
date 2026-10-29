@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <Network/Network.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
@@ -739,9 +740,8 @@ NSUUID *UUIDFromString(NSString *string) {
   return [[NSUUID alloc] initWithUUIDBytes:uuid];
 }
 
-WKWebsiteDataStore *
-createDataStoreForPartition(const char *partitionIdentifier) {
-  NSString *identifier = [NSString stringWithUTF8String:partitionIdentifier];
+static WKWebsiteDataStore *
+dataStoreForPartitionIdentifier(NSString *identifier) {
   if ([identifier hasPrefix:@"persist:"]) {
     // persistent
     identifier = [identifier substringFromIndex:8];
@@ -764,6 +764,145 @@ createDataStoreForPartition(const char *partitionIdentifier) {
     // ephemeral
     return [WKWebsiteDataStore nonPersistentDataStore];
   }
+}
+
+static bool runOnMainThreadSyncBool(bool (^block)(void));
+
+// Session proxies, keyed by partition identifier. Ephemeral partitions hand
+// each view its own data store, so every store given out for a partition is
+// tracked weakly and a later setProxy reaches views that already exist.
+static NSMutableDictionary<NSString *, NSArray *> *partitionProxyConfigurations;
+static NSMutableDictionary<NSString *, NSHashTable<WKWebsiteDataStore *> *>
+    *partitionDataStores;
+
+static void applyProxyConfigurations(WKWebsiteDataStore *dataStore,
+                                     NSArray *proxyConfigurations) {
+  if (@available(macOS 14.0, *)) {
+    dataStore.proxyConfigurations = proxyConfigurations ?: @[];
+  }
+}
+
+WKWebsiteDataStore *
+createDataStoreForPartition(const char *partitionIdentifier) {
+  NSString *identifier = [NSString stringWithUTF8String:partitionIdentifier];
+  WKWebsiteDataStore *dataStore = dataStoreForPartitionIdentifier(identifier);
+
+  if (!partitionDataStores) {
+    partitionDataStores = [NSMutableDictionary dictionary];
+  }
+  NSHashTable *stores = partitionDataStores[identifier];
+  if (!stores) {
+    stores = [NSHashTable weakObjectsHashTable];
+    partitionDataStores[identifier] = stores;
+  }
+  if (![stores containsObject:dataStore]) {
+    [stores addObject:dataStore];
+    NSArray *proxyConfigurations = partitionProxyConfigurations[identifier];
+    if (proxyConfigurations) {
+      applyProxyConfigurations(dataStore, proxyConfigurations);
+    }
+  }
+  return dataStore;
+}
+
+extern "C" bool sessionSupportsProxy() {
+  if (@available(macOS 14.0, *)) {
+    return true;
+  }
+  return false;
+}
+
+static nw_proxy_config_t proxyConfigurationFromDictionary(NSDictionary *proxy)
+    API_AVAILABLE(macos(14.0)) {
+  NSString *type = proxy[@"type"];
+  NSString *host = proxy[@"host"];
+  NSNumber *port = proxy[@"port"];
+  if (![type isKindOfClass:[NSString class]] ||
+      ![host isKindOfClass:[NSString class]] || host.length == 0 ||
+      ![port isKindOfClass:[NSNumber class]] || port.integerValue < 1 ||
+      port.integerValue > 65535) {
+    return nil;
+  }
+
+  nw_endpoint_t endpoint = nw_endpoint_create_host(
+      host.UTF8String, [port stringValue].UTF8String);
+  nw_proxy_config_t config = nil;
+  if ([type isEqualToString:@"http"]) {
+    config = nw_proxy_config_create_http_connect(endpoint, nil);
+  } else if ([type isEqualToString:@"socks5"]) {
+    config = nw_proxy_config_create_socksv5(endpoint);
+  }
+  if (!config) {
+    return nil;
+  }
+
+  for (NSString *key in @[ @"matchDomains", @"excludedDomains" ]) {
+    id domains = proxy[key];
+    if (!domains) {
+      continue;
+    }
+    if (![domains isKindOfClass:[NSArray class]]) {
+      return nil;
+    }
+    for (NSString *domain in domains) {
+      if (![domain isKindOfClass:[NSString class]] || domain.length == 0) {
+        return nil;
+      }
+      if ([key isEqualToString:@"matchDomains"]) {
+        nw_proxy_config_add_match_domain(config, domain.UTF8String);
+      } else {
+        nw_proxy_config_add_excluded_domain(config, domain.UTF8String);
+      }
+    }
+  }
+  return config;
+}
+
+// proxyJson: {"type": "http" | "socks5", "host": "127.0.0.1", "port": 8080,
+// "matchDomains": [...], "excludedDomains": [...]}, or null to clear.
+// Applies to the partition's live data stores and to every store created
+// for it later. Returns false when unsupported or the proxy is invalid.
+extern "C" bool sessionSetProxy(const char *partitionIdentifier,
+                                const char *proxyJson) {
+  if (@available(macOS 14.0, *)) {
+    if (!partitionIdentifier || !proxyJson) {
+      return false;
+    }
+    NSString *partitionStr = [NSString stringWithUTF8String:partitionIdentifier];
+    NSData *proxyData = [[NSString stringWithUTF8String:proxyJson]
+        dataUsingEncoding:NSUTF8StringEncoding];
+    id proxy = [NSJSONSerialization
+        JSONObjectWithData:proxyData
+                   options:NSJSONReadingFragmentsAllowed
+                     error:nil];
+
+    NSArray *proxyConfigurations = nil;
+    if ([proxy isKindOfClass:[NSDictionary class]]) {
+      nw_proxy_config_t config = proxyConfigurationFromDictionary(proxy);
+      if (!config) {
+        return false;
+      }
+      proxyConfigurations = @[ config ];
+    } else if (proxy != [NSNull null]) {
+      return false;
+    }
+
+    return runOnMainThreadSyncBool(^bool {
+      if (!partitionProxyConfigurations) {
+        partitionProxyConfigurations = [NSMutableDictionary dictionary];
+      }
+      if (proxyConfigurations) {
+        partitionProxyConfigurations[partitionStr] = proxyConfigurations;
+      } else {
+        [partitionProxyConfigurations removeObjectForKey:partitionStr];
+      }
+      for (WKWebsiteDataStore *dataStore in partitionDataStores[partitionStr]) {
+        applyProxyConfigurations(dataStore, proxyConfigurations);
+      }
+      return true;
+    });
+  }
+  return false;
 }
 
 static NSString *normalizeViewsRelativePath(NSString *urlString) {

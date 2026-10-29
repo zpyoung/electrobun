@@ -76,6 +76,7 @@ import {
 import { parseWebviewEventBridgeMessage } from "./eventBridge";
 import { ffiCStringToString } from "./ffiCString";
 import { rasterizeNativeText } from "./nativeTextBitmap";
+import { setSessionProxy, type SessionProxy } from "./sessionProxy";
 
 function getElectrobunLibraryPathCandidates(fileName: string) {
 	const candidates = new Set<string>();
@@ -1102,6 +1103,14 @@ export const native = (() => {
 			sessionClearStorageData: {
 				args: [FFIType.cstring, FFIType.cstring],
 				returns: FFIType.void,
+			},
+			sessionSupportsProxy: {
+				args: [],
+				returns: FFIType.bool,
+			},
+			sessionSetProxy: {
+				args: [FFIType.cstring, FFIType.cstring],
+				returns: FFIType.bool,
 			},
 
 			// URL scheme handler (macOS only)
@@ -3272,6 +3281,8 @@ export interface CookieFilter {
 	session?: boolean;
 }
 
+export type { SessionProxy };
+
 export type StorageType =
 	| "cookies"
 	| "localStorage"
@@ -3364,6 +3375,27 @@ class SessionInstance {
 			toCString(JSON.stringify(typesArray)),
 		);
 	}
+
+	/**
+	 * Route this session's network traffic through a proxy, or pass null to
+	 * connect directly again. Applies to views already using the partition and
+	 * to views created later. Throws where session proxies aren't supported;
+	 * check Session.supportsProxy first.
+	 */
+	setProxy(proxy: SessionProxy | null): void {
+		setSessionProxy(
+			{
+				supportsProxy: () => native_.symbols.sessionSupportsProxy(),
+				setProxy: (partition, proxyJson) =>
+					native_.symbols.sessionSetProxy(
+						toCString(partition),
+						toCString(proxyJson),
+					),
+			},
+			this.partition,
+			proxy,
+		);
+	}
 }
 
 // Cache of session instances
@@ -3390,6 +3422,14 @@ export const Session = {
 	 */
 	get defaultSession(): SessionInstance {
 		return Session.fromPartition("persist:default");
+	},
+
+	/**
+	 * Whether session.setProxy() can route traffic on this platform: macOS 14
+	 * or later with the native WebKit renderer.
+	 */
+	get supportsProxy(): boolean {
+		return native_.symbols.sessionSupportsProxy();
 	},
 };
 

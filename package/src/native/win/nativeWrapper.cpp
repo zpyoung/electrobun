@@ -14632,6 +14632,18 @@ extern "C" ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionI
     }
 }
 
+// Session proxies are not implemented for WebView2 or CEF on Windows yet.
+// Report it so Session.setProxy() can fail loudly instead of ignoring the call.
+extern "C" ELECTROBUN_EXPORT bool sessionSupportsProxy() {
+    return false;
+}
+
+extern "C" ELECTROBUN_EXPORT bool sessionSetProxy(const char* partitionIdentifier, const char* proxyJson) {
+    (void)partitionIdentifier;
+    (void)proxyJson;
+    return false;
+}
+
 // URL scheme handler - macOS only, stub for Windows
 extern "C" ELECTROBUN_EXPORT void setURLOpenHandler(void (*callback)(const char*)) {
     (void)callback;

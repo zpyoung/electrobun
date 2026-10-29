@@ -243,6 +243,48 @@ While Linux CEF creates its browser, it retains the latest `loadURL()` or
 On macOS, WKWebView uses file-URL loading for local files. `getPageZoom()` reads
 on the main thread after pending initialization and zoom changes.
 
+## Session proxies
+
+`Session.fromPartition(partition).setProxy()` sends every request from views
+in that partition through a proxy: page loads, subresources, `fetch()` and
+WebSockets. The proxy also resolves the hostnames, so an app can run a local
+proxy that maps names such as `feature-a.localhost` to different local ports
+without touching the system's DNS or proxy settings.
+
+```ts
+import { BrowserView, Session } from "electrobun/main";
+
+if (Session.supportsProxy) {
+  Session.fromPartition("persist:preview").setProxy({
+    type: "http",
+    host: "127.0.0.1",
+    port: 8899,
+    matchDomains: ["localhost"],
+  });
+}
+
+const view = new BrowserView({
+  url: "http://feature-a.localhost/",
+  partition: "persist:preview",
+});
+```
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `type` | `"http" \| "socks5"` | `http` opens every connection, plain HTTP included, with `CONNECT`. |
+| `host`, `port` | `string`, `number` | The proxy's address. |
+| `matchDomains` | `string[]` | Only these domains and their subdomains use the proxy. |
+| `excludedDomains` | `string[]` | These domains and their subdomains never use the proxy. |
+
+The proxy applies to views already using the partition and to views created
+later. Pass `null` to connect directly again. The setting lasts until the app
+quits.
+
+Session proxies need macOS 14 or later and apply to the native WebKit
+renderer. `Session.supportsProxy` is `false` on older macOS, Linux and
+Windows, and `setProxy()` throws there rather than loading pages without the
+proxy. CEF views don't use the session proxy.
+
 ## Host message queue diagnostics
 
 `getHostMessageQueueStats()` reports the main

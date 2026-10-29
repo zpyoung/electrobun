@@ -1,2 +1,3 @@
 # base v2.0.5
 # One patch per line, merged in this order: <branch> <test command run from the repo root>
+patch/drop-source-paths cd package && node --test src/shared/drop-source-paths.test.js && scripts/test-macos-drop-source-paths.sh && node scripts/run-bun-test.js src/sdks/main/proc/eventBridge.test.ts src/shared/native-symbol-contract.test.ts

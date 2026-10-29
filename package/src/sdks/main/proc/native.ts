@@ -355,6 +355,25 @@ const core = (() => {
 				args: [FFIType.bool, FFIType.bool],
 				returns: FFIType.void,
 			},
+			isolatedPreviewSupported: {
+				args: [],
+				returns: FFIType.bool,
+			},
+			setNextWebviewIsolatedPreview: {
+				args: [FFIType.cstring],
+				returns: FFIType.bool,
+			},
+			webviewIsolatedPreviewRespond: {
+				args: [
+					FFIType.u32,
+					FFIType.u32,
+					FFIType.u32,
+					FFIType.cstring,
+					FFIType.ptr,
+					FFIType.u64,
+				],
+				returns: FFIType.bool,
+			},
 			getWebviewPointer: {
 				args: [FFIType.u32],
 				returns: FFIType.ptr,
@@ -1977,6 +1996,7 @@ const _ffiImpl = {
 			startTransparent: boolean;
 			startPassthrough: boolean;
 			spellCheck: boolean;
+			isolatedPreview: string | null;
 		}): number => {
 			const {
 				windowId,
@@ -1994,12 +2014,22 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				isolatedPreview,
 			} = params;
 			ensureWebviewRuntimeConfigured();
 			core_.symbols.setNextWebviewAllowedProtocols(
 				allowedProtocols.views,
 				allowedProtocols.appData,
 			);
+			if (
+				isolatedPreview !== null &&
+				!core_.symbols.setNextWebviewIsolatedPreview(toCString(isolatedPreview))
+			) {
+				throw (
+					getCoreLastError() ||
+					`Isolated preview scheme "${isolatedPreview}" is not supported`
+				);
+			}
 
 			const webviewId = core_.symbols.createWebview(
 				windowId,
@@ -2025,12 +2055,38 @@ const _ffiImpl = {
 				startPassthrough,
 				spellCheck,
 			);
+			const createError = webviewId ? null : getCoreLastError();
+			if (isolatedPreview !== null) {
+				// A creation that failed before the native view existed must not
+				// leave the request for the next webview.
+				core_.symbols.setNextWebviewIsolatedPreview(toCString(""));
+			}
 
 			if (!webviewId) {
-				throw getCoreLastError() || "Failed to create webview";
+				throw createError || "Failed to create webview";
 			}
 
 			return webviewId;
+		},
+		isolatedPreviewSupported: (): boolean => {
+			return core_.symbols.isolatedPreviewSupported();
+		},
+		webviewIsolatedPreviewRespond: (params: {
+			id: number;
+			requestId: number;
+			status: number;
+			headers: Record<string, string>;
+			body: Uint8Array;
+		}): boolean => {
+			const { id, requestId, status, headers, body } = params;
+			return core_.symbols.webviewIsolatedPreviewRespond(
+				id,
+				requestId,
+				status,
+				toCString(JSON.stringify(headers)),
+				body.byteLength > 0 ? ptr(body) : null,
+				BigInt(body.byteLength),
+			);
 		},
 		getWebviewPointer: (params: { id: number }): Pointer | null => {
 			return normalizeFFIPointer(core_.symbols.getWebviewPointer(params.id));
@@ -3411,6 +3467,12 @@ const webviewDecideNavigation = new JSCallback(
 const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 	BrowserView.ensureWrapped(id);
 
+	// Only the native callback may deliver scheme requests; page script can post
+	// any event name through the event bridge.
+	if (eventName === "isolated-preview-request") {
+		return { success: false };
+	}
+
 	core_.symbols.dispatchHostWebviewEvent(
 		id,
 		toCString(eventName),
@@ -3496,6 +3558,12 @@ const webviewEventJSCallback = new JSCallback(
 				_eventName,
 				_detail,
 			});
+			return;
+		}
+
+		// Scheme requests are answered here and never reach the host webview.
+		if (eventName === "isolated-preview-request") {
+			void BrowserView.answerIsolatedPreviewRequest(id, detail);
 			return;
 		}
 
@@ -3738,6 +3806,7 @@ type WebviewTagInitParams = {
 	transparent: boolean;
 	passthrough: boolean;
 	spellCheck: boolean;
+	isolatedPreview?: string;
 };
 
 type WgpuTagInitParams = {
@@ -3764,6 +3833,7 @@ export const internalRpcHandlers = {
 				transparent,
 				passthrough,
 				spellCheck,
+				isolatedPreview,
 			} = params;
 
 			const url = !params.url && !html ? "https://electrobun.dev" : params.url;
@@ -3783,6 +3853,9 @@ export const internalRpcHandlers = {
 				startTransparent: transparent,
 				startPassthrough: passthrough,
 				spellCheck,
+				// An empty attribute must fail creation, not fall back to an ordinary view.
+				isolatedPreview:
+					isolatedPreview === undefined ? null : { scheme: isolatedPreview },
 			});
 
 			// Emit synchronously before resolving the preload request so callers can

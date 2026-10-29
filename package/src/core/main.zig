@@ -2104,6 +2104,8 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
     const transparent = jsonBool(params_object.get("transparent") orelse .{ .bool = false }) orelse false;
     const passthrough = jsonBool(params_object.get("passthrough") orelse .{ .bool = false }) orelse false;
     const spell_check = jsonBool(params_object.get("spellCheck") orelse .{ .bool = false }) orelse false;
+    // Present but empty or malformed must fail creation, never fall back to an ordinary view.
+    const isolated_preview: ?[]const u8 = if (params_object.get("isolatedPreview")) |value| jsonString(value) orelse "" else null;
     const url_value = params_object.get("url");
     const html_value = params_object.get("html");
     const preload_value = params_object.get("preload");
@@ -2144,6 +2146,17 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         null;
     defer if (rules_json) |allocated| allocator.free(allocated);
 
+    if (isolated_preview) |scheme| {
+        const scheme_z = duplicateSentinelString(scheme) orelse return null;
+        defer allocator.free(scheme_z);
+        if (!setNextWebviewIsolatedPreview(scheme_z.ptr)) return null;
+    }
+    // A creation that fails before the native view exists must not leave the
+    // request for the next webview.
+    defer if (isolated_preview != null) {
+        _ = setNextWebviewIsolatedPreview("");
+    };
+
     const webview_id = createWebview(
         window_id,
         host_webview_id,
@@ -2163,7 +2176,7 @@ fn createManagedWebviewFromInternalRequest(params: std.json.Value) ?u32 {
         secret_key_z.ptr,
         preload_z.ptr,
         "",
-        sandbox,
+        sandbox or isolated_preview != null,
         transparent,
         passthrough,
         spell_check,
@@ -3320,6 +3333,52 @@ export fn setNextWebviewAllowedProtocols(allow_views: bool, allow_app_data: bool
         "setNextWebviewAllowedProtocols",
     ) orelse return;
     set_allowed_protocols(allow_views, allow_app_data);
+}
+
+export fn isolatedPreviewSupported() bool {
+    clearLastError();
+    const IsolatedPreviewSupportedFn = *const fn () callconv(.c) bool;
+    const isolated_preview_supported = lookupNativeSymbol(
+        IsolatedPreviewSupportedFn,
+        "isolatedPreviewSupported",
+    ) orelse return false;
+    return isolated_preview_supported();
+}
+
+/// Marks the next created webview as an isolated preview served by `scheme`.
+/// An empty scheme clears a pending request.
+export fn setNextWebviewIsolatedPreview(scheme: [*:0]const u8) bool {
+    clearLastError();
+    const SetNextWebviewIsolatedPreviewFn = *const fn ([*:0]const u8) callconv(.c) bool;
+    const set_isolated_preview = lookupNativeSymbol(
+        SetNextWebviewIsolatedPreviewFn,
+        "setNextWebviewIsolatedPreview",
+    ) orelse return false;
+    if (!set_isolated_preview(scheme)) {
+        if (std.mem.span(scheme).len > 0) {
+            setLastError("Isolated preview scheme \"{s}\" is invalid or unsupported on this platform", .{std.mem.span(scheme)});
+        }
+        return false;
+    }
+    return true;
+}
+
+export fn webviewIsolatedPreviewRespond(
+    webview_id: u32,
+    request_id: u32,
+    status: u32,
+    headers_json: [*:0]const u8,
+    body: ?[*]const u8,
+    body_len: usize,
+) bool {
+    clearLastError();
+    const WebviewIsolatedPreviewRespondFn = *const fn (WebviewPtr, u32, u32, [*:0]const u8, ?[*]const u8, usize) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const respond = lookupNativeSymbol(
+        WebviewIsolatedPreviewRespondFn,
+        "webviewIsolatedPreviewRespond",
+    ) orelse return false;
+    return respond(webview, request_id, status, headers_json, body, body_len);
 }
 
 export fn getWebviewPointer(webview_id: u32) WebviewPtr {

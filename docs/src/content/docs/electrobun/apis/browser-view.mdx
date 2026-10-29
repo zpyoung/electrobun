@@ -183,6 +183,7 @@ The constructor accepts `Partial<BrowserViewOptions>`.
 | `startTransparent` | `boolean` | `false` | Create the native layer transparent. |
 | `startPassthrough` | `boolean` | `false` | Create with input passthrough enabled. |
 | `spellCheck` | `boolean` | `false` | Enable native spell checking where supported. |
+| `isolatedPreview` | `{ scheme: string; handler?: IsolatedPreviewHandler } \| null` | `null` | Create an [isolated preview](#isolated-preview-views) served only by `scheme`. |
 
 <Aside type="note">
 Use the DOM `<electrobun-webview>` element when the view's bounds should follow
@@ -242,6 +243,73 @@ While Linux CEF creates its browser, it retains the latest `loadURL()` or
 `loadHTML()` request and starts that navigation when the browser is ready.
 On macOS, WKWebView uses file-URL loading for local files. `getPageZoom()` reads
 on the main thread after pending initialization and zoom changes.
+
+## Isolated preview views
+
+An isolated preview shows a document the app doesn't trust, such as
+generated HTML, with its pages and assets served by the app instead of a
+server. The view is throwaway and sandboxed. Native code blocks every way the
+page could reach out before it loads, so page script and response headers
+can't lift the blocks:
+
+- Documents, subresources, `fetch`, workers and iframes load only from the
+  preview's own scheme, plus `about:blank`, `about:srcdoc`, `data:` and
+  `blob:`. Every other load, including WebSockets, beacons and preconnects, is
+  blocked by a WebKit content rule list that is installed before the first
+  navigation.
+- WebRTC, WebAssembly, WebGL and service workers are unavailable, because the
+  page runs in WebKit Lockdown Mode.
+- Storage is a fresh non-persistent data store for each view, shared with no
+  other view and discarded with it. The `partition` option is ignored.
+- Top-level and frame navigations off the scheme are cancelled, as are
+  cmd-clicks, popups and downloads. None of them produce a `new-window-open` or
+  download event.
+- Camera, microphone, location and file-picker requests are denied without a
+  prompt.
+- `views://` and `appdata://` are not available, and RPC is disabled as with
+  `sandbox: true`.
+
+Each request to the scheme is passed to the handler as a standard `Request`,
+and its `Response` is returned to the page as is. Requests that arrive while
+the view has no handler get a 404. Request bodies up to 16 MB are forwarded
+when WebKit hands them to the scheme handler, which it does for string bodies
+but not for every body type; larger bodies get a 413. The scheme must be lowercase letters,
+digits and hyphens, start with a letter, and not be a scheme WebKit handles
+itself (such as `https` or `file`), `views` or `appdata`.
+
+```ts
+import { BrowserView } from "electrobun/main";
+import { file } from "bun";
+
+if (BrowserView.isIsolatedPreviewSupported()) {
+  const preview = new BrowserView({
+    windowId: win.id,
+    url: "app-preview://report/index.html",
+    isolatedPreview: {
+      scheme: "app-preview",
+      handler: async (request) => {
+        const path = new URL(request.url).pathname;
+        const asset = file(`/path/to/report${path}`);
+        return (await asset.exists())
+          ? new Response(asset)
+          : new Response("Not found", { status: 404 });
+      },
+    },
+  });
+  void preview;
+}
+```
+
+The handler decides which files the preview can read, so check that every
+resolved path stays inside the folder you mean to share. To answer requests for
+a preview created by an
+[`<electrobun-webview isolated-preview>`](/electrobun/apis/browser/electrobun-webview-tag/#isolated-previews)
+tag, call `view.setIsolatedPreviewHandler(handler)` from a `BrowserView.on("created")`
+listener. A preview refuses `loadHTML()`.
+
+Isolated previews are supported only by the native renderer on macOS.
+`BrowserView.isIsolatedPreviewSupported()` returns `false` on Linux and
+Windows, and creating one there, or with `renderer: "cef"`, throws.
 
 ## Host message queue diagnostics
 
@@ -412,13 +480,13 @@ transport; repeated calls are safe.
 ## Public methods
 
 - Content: `loadURL`, `loadHTML`, `executeJavascript`, `setNavigationRules`,
-  `setSpellCheck`.
+  `setSpellCheck`, `setIsolatedPreviewHandler`.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
   `findInPage`, `stopFindInPage`.
 - Display: `setPageZoom`, `getPageZoom`.
 - Lifecycle and events: `on`, `remove`, `ptr`.
 - Static ownership: `getById`, `getAll`, `ensureWrapped`, `adoptExisting`, `on`,
-  `off`, and `defineRPC`.
+  `off`, `isIsolatedPreviewSupported` and `defineRPC`.
 
 ## Native SDKs
 

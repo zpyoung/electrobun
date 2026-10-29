@@ -52,6 +52,7 @@ void typedWebview;
 | `spellcheck` | boolean attribute | Enables native WKWebView spell checking where supported. |
 | `masks` | comma-separated selectors | Cuts holes in the native layer for matching host elements. |
 | `navigation-rules` | JSON string array | Initial native navigation allow/block rules. |
+| `isolated-preview` | URL scheme | Creates an [isolated preview](#isolated-previews) served only by that scheme. Implies `sandbox`. |
 
 Boolean attributes are enabled by their presence. For `spellcheck`, an
 explicit value of `"false"` is also treated as disabled.
@@ -191,6 +192,34 @@ console.log({ supported, enabled: webview.spellCheckEnabled });
 The promise resolves to `true` only when the current renderer supports the
 change. Native WKWebView on macOS is currently supported; other renderers
 return `false` without changing renderer state.
+
+## Isolated Previews
+
+```html
+<electrobun-webview isolated-preview="app-preview" src="about:blank"></electrobun-webview>
+```
+
+The child is created as an
+[isolated preview](/electrobun/apis/browser-view/#isolated-preview-views): a
+throwaway, sandboxed view that loads only from `app-preview:`, with outbound
+network, permissions, popups and downloads blocked natively. The main process
+answers its requests:
+
+```ts
+import { BrowserView } from "electrobun/main";
+
+BrowserView.on("created", (view) => {
+  view.setIsolatedPreviewHandler(async () => {
+    return new Response("<!doctype html><h1>Preview</h1>", {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  });
+});
+```
+
+Set the handler before navigating the tag to a preview URL. The attribute is
+creation-only, and on platforms without isolated previews the tag fails to
+initialize.
 
 ## Find And Developer Tools
 

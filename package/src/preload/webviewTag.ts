@@ -123,8 +123,10 @@ export class ElectrobunWebviewTag extends HTMLElement {
 			| "cef";
 		const masks = this.getAttribute("masks");
 		const navigationRules = this.getInitialNavigationRules();
-		// Sandbox attribute: when present, the child webview is sandboxed (no RPC, events only)
-		const sandbox = this.hasAttribute("sandbox");
+		const isolatedPreview = this.getAttribute("isolated-preview");
+		// Sandbox attribute: when present, the child webview is sandboxed (no RPC, events only).
+		// An isolated preview is always sandboxed.
+		const sandbox = this.hasAttribute("sandbox") || isolatedPreview !== null;
 		this.sandboxed = sandbox;
 		// Read transparent/passthrough attributes for initial state (avoids flash)
 		const transparent = this.hasAttribute("transparent");
@@ -158,6 +160,7 @@ export class ElectrobunWebviewTag extends HTMLElement {
 				passthrough,
 				spellCheck,
 				...(navigationRules === null ? {} : { navigationRules }),
+				...(isolatedPreview === null ? {} : { isolatedPreview }),
 			};
 
 			const webviewId = (await request(

@@ -154,6 +154,15 @@ jobs:
         run: hutch test:macos-spell-check
         working-directory: package
 
+      - name: Test isolated preview contract
+        run: hutch test:isolated-preview
+        working-directory: package
+
+      - name: Exercise macOS isolated preview fences
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-isolated-preview
+        working-directory: package
+
       - name: Setup MSVC Developer Command Prompt
         if: matrix.platform == 'win32'
         uses: ilammy/msvc-dev-cmd@v1

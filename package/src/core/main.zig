@@ -1956,7 +1956,10 @@ fn buildHostWebviewEventJavascript(
     defer allocator.free(encoded_detail);
 
     const event_name_slice = std.mem.span(event_name);
-    if (std.mem.eql(u8, event_name_slice, "new-window-open") or std.mem.eql(u8, event_name_slice, "host-message")) {
+    if (std.mem.eql(u8, event_name_slice, "new-window-open") or
+        std.mem.eql(u8, event_name_slice, "host-message") or
+        std.mem.eql(u8, event_name_slice, "load-failed"))
+    {
         return allocateOwnedJavascriptString(
             "document.querySelector('#electrobun-webview-{d}').emit({s}, (() => {{ try {{ return JSON.parse({s}); }} catch {{ return {s}; }} }})());",
             .{ webview_id, encoded_event_name, encoded_detail, encoded_detail },
@@ -2266,6 +2269,27 @@ fn handleInternalRequest(request_object: std.json.ObjectMap) void {
             true,
             webviewSetSpellCheck(webview_id, enabled),
         );
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "webviewTagReloadIgnoringCache")) {
+        if (params != .object) return;
+        const webview_id = jsonU32(params.object.get("id") orelse return) orelse return;
+        sendInternalBridgeResponse(host_webview_id, request_id, true, webviewReloadIgnoringCache(webview_id));
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "webviewTagSupportsReloadIgnoringCache")) {
+        if (params != .object) return;
+        const webview_id = jsonU32(params.object.get("id") orelse return) orelse return;
+        sendInternalBridgeResponse(host_webview_id, request_id, true, webviewSupportsReloadIgnoringCache(webview_id));
+        return;
+    }
+
+    if (std.mem.eql(u8, method, "webviewTagSupportsLoadFailed")) {
+        if (params != .object) return;
+        const webview_id = jsonU32(params.object.get("id") orelse return) orelse return;
+        sendInternalBridgeResponse(host_webview_id, request_id, true, webviewSupportsLoadFailed(webview_id));
         return;
     }
 
@@ -3414,6 +3438,39 @@ export fn webviewReload(webview_id: u32) void {
     webview_reload(webview);
 }
 
+export fn webviewReloadIgnoringCache(webview_id: u32) bool {
+    clearLastError();
+    const WebviewReloadIgnoringCacheFn = *const fn (WebviewPtr) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const webview_reload_ignoring_cache = lookupNativeSymbol(
+        WebviewReloadIgnoringCacheFn,
+        "webviewReloadIgnoringCache",
+    ) orelse return false;
+    return webview_reload_ignoring_cache(webview);
+}
+
+export fn webviewSupportsReloadIgnoringCache(webview_id: u32) bool {
+    clearLastError();
+    const WebviewSupportsReloadIgnoringCacheFn = *const fn (WebviewPtr) callconv(.c) bool;
+    const webview = lookupWebviewPtr(webview_id) orelse return false;
+    const webview_supports_reload_ignoring_cache = lookupNativeSymbol(
+        WebviewSupportsReloadIgnoringCacheFn,
+        "webviewSupportsReloadIgnoringCache",
+    ) orelse return false;
+    return webview_supports_reload_ignoring_cache(webview);
+}
+
+export fn webviewSupportsLoadFailed(webview_id: u32) bool {
+    clearLastError();
+    const WebviewSupportsLoadFailedFn = *const fn (WebviewPtr) callconv(.c) bool;
+    const webview = lookupWebviewPtr(webview_id) orelse return false;
+    const webview_supports_load_failed = lookupNativeSymbol(
+        WebviewSupportsLoadFailedFn,
+        "webviewSupportsLoadFailed",
+    ) orelse return false;
+    return webview_supports_load_failed(webview);
+}
+
 export fn webviewRemove(webview_id: u32) void {
     clearLastError();
     const WebviewRemoveFn = *const fn (WebviewPtr) callconv(.c) void;
@@ -4487,6 +4544,17 @@ test "host webview JSON events encode detail as data" {
         js,
         "catch { return \"null); globalThis.pwned = \\\"yes\\\"; //\"; }",
     ) != null);
+}
+
+test "host webview load-failed events deliver parsed detail" {
+    const js = buildHostWebviewEventJavascript(
+        7,
+        "load-failed",
+        "{\"url\":\"http://127.0.0.1:9/\",\"code\":-1004}",
+    ) orelse return error.OutOfMemory;
+    defer allocator.free(js);
+
+    try std.testing.expect(std.mem.indexOf(u8, js, ".emit(\"load-failed\", (() => { try { return JSON.parse(") != null);
 }
 
 var captured_runtime_callback_payload: ?[*:0]const u8 = null;

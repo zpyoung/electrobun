@@ -1,6 +1,14 @@
 import ElectrobunEvent from "./event";
 
 type DetailData = { detail: string };
+type LoadFailedData = {
+	detail: {
+		url: string;
+		domain: string;
+		code: number;
+		description: string;
+	};
+};
 type NewWindowOpenData = {
 	detail:
 		| string
@@ -36,4 +44,6 @@ export default {
 		new ElectrobunEvent<DetailData, {}>("download-completed", data),
 	downloadFailed: (data: DetailData) =>
 		new ElectrobunEvent<DetailData, {}>("download-failed", data),
+	loadFailed: (data: LoadFailedData) =>
+		new ElectrobunEvent<LoadFailedData, {}>("load-failed", data),
 };

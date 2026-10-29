@@ -426,6 +426,18 @@ const core = (() => {
 				args: [FFIType.u32, FFIType.bool],
 				returns: FFIType.bool,
 			},
+			webviewReloadIgnoringCache: {
+				args: [FFIType.u32],
+				returns: FFIType.bool,
+			},
+			webviewSupportsReloadIgnoringCache: {
+				args: [FFIType.u32],
+				returns: FFIType.bool,
+			},
+			webviewSupportsLoadFailed: {
+				args: [FFIType.u32],
+				returns: FFIType.bool,
+			},
 			setWebviewNavigationRules: {
 				args: [FFIType.u32, FFIType.cstring],
 				returns: FFIType.void,
@@ -2095,6 +2107,15 @@ const _ffiImpl = {
 		webviewSetSpellCheck: (params: { id: number; enabled: boolean }) => {
 			return core_.symbols.webviewSetSpellCheck(params.id, params.enabled);
 		},
+		webviewReloadIgnoringCache: (params: { id: number }) => {
+			return core_.symbols.webviewReloadIgnoringCache(params.id);
+		},
+		webviewSupportsReloadIgnoringCache: (params: { id: number }) => {
+			return core_.symbols.webviewSupportsReloadIgnoringCache(params.id);
+		},
+		webviewSupportsLoadFailed: (params: { id: number }) => {
+			return core_.symbols.webviewSupportsLoadFailed(params.id);
+		},
 		setWebviewNavigationRules: (params: { id: number; rulesJson: string }) => {
 			core_.symbols.setWebviewNavigationRules(params.id, toCString(params.rulesJson));
 		},
@@ -3432,6 +3453,7 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		"load-started": "loadStarted",
 		"load-committed": "loadCommitted",
 		"load-finished": "loadFinished",
+		"load-failed": "loadFailed",
 	};
 
 	const mappedName = eventMap[eventName];
@@ -3460,7 +3482,8 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		eventName === "download-started" ||
 		eventName === "download-progress" ||
 		eventName === "download-completed" ||
-		eventName === "download-failed"
+		eventName === "download-failed" ||
+		eventName === "load-failed"
 	) {
 		try {
 			parsedDetail = JSON.parse(detail);
@@ -3817,6 +3840,15 @@ export const internalRpcHandlers = {
 		},
 		webviewTagSetSpellCheck: (params: { id: number; enabled: boolean }) => {
 			return core_.symbols.webviewSetSpellCheck(params.id, params.enabled);
+		},
+		webviewTagReloadIgnoringCache: (params: { id: number }) => {
+			return core_.symbols.webviewReloadIgnoringCache(params.id);
+		},
+		webviewTagSupportsReloadIgnoringCache: (params: { id: number }) => {
+			return core_.symbols.webviewSupportsReloadIgnoringCache(params.id);
+		},
+		webviewTagSupportsLoadFailed: (params: { id: number }) => {
+			return core_.symbols.webviewSupportsLoadFailed(params.id);
 		},
 		restoreWindowFocusAfterExternalDrop: (params: { windowId: number }) => {
 			if (!getWindowPtr(params.windowId)) return false;

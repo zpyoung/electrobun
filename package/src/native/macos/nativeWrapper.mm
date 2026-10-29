@@ -28,6 +28,7 @@ static bool wgpuDebugEnabled() {
 }
 #include "../shared/pending_resize_queue.h"
 #include "inspector_layout.h"
+#include "load_failed.h"
 #include "spell_check.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
@@ -957,7 +958,11 @@ void releaseObjCObject(id objcObject) {
 - (void)goBack;
 - (void)goForward;
 - (void)reload;
+- (void)reloadIgnoringCache;
 - (void)remove;
+
+- (BOOL)supportsReloadIgnoringCache;
+- (BOOL)supportsLoadFailed;
 
 - (void)setTransparent:(BOOL)transparent;
 - (void)setAlphaBlending:(BOOL)enabled;
@@ -1538,6 +1543,17 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 
 - (BOOL)setSpellCheck:(BOOL)enabled {
   (void)enabled;
+  return NO;
+}
+
+- (void)reloadIgnoringCache {
+}
+
+- (BOOL)supportsReloadIgnoringCache {
+  return NO;
+}
+
+- (BOOL)supportsLoadFailed {
   return NO;
 }
 
@@ -2535,6 +2551,20 @@ static void schedulePendingResizeDrain() {
                          strdup(urlString.UTF8String));
   }
 }
+- (void)webView:(WKWebView *)webView
+    didFailProvisionalNavigation:(WKNavigation *)navigation
+                       withError:(NSError *)error {
+  NSString *detail = electrobun::loadFailedEventDetail(error, webView.URL);
+  self.zigEventHandler(self.webviewId, strdup("load-failed"),
+                       strdup(detail.UTF8String));
+}
+- (void)webView:(WKWebView *)webView
+    didFailNavigation:(WKNavigation *)navigation
+            withError:(NSError *)error {
+  NSString *detail = electrobun::loadFailedEventDetail(error, webView.URL);
+  self.zigEventHandler(self.webviewId, strdup("load-failed"),
+                       strdup(detail.UTF8String));
+}
 
 // Called when navigationAction policy returns .download
 - (void)webView:(WKWebView *)webView
@@ -3345,6 +3375,15 @@ static void schedulePendingResizeDrain() {
 }
 - (void)reload {
   [self.webView reload];
+}
+- (void)reloadIgnoringCache {
+  [self.webView reloadFromOrigin];
+}
+- (BOOL)supportsReloadIgnoringCache {
+  return YES;
+}
+- (BOOL)supportsLoadFailed {
+  return YES;
 }
 
 - (void)remove {
@@ -8708,6 +8747,26 @@ extern "C" void webviewReload(AbstractView *abstractView) {
   runOnMainThreadAsyncVoid(^{
     [abstractView reload];
   });
+}
+
+extern "C" bool webviewReloadIgnoringCache(AbstractView *abstractView) {
+  if (!abstractView || !globalAbstractViews[@(abstractView.webviewId)] ||
+      ![abstractView supportsReloadIgnoringCache]) {
+    return false;
+  }
+
+  runOnMainThreadAsyncVoid(^{
+    [abstractView reloadIgnoringCache];
+  });
+  return true;
+}
+
+extern "C" bool webviewSupportsReloadIgnoringCache(AbstractView *abstractView) {
+  return abstractView && [abstractView supportsReloadIgnoringCache];
+}
+
+extern "C" bool webviewSupportsLoadFailed(AbstractView *abstractView) {
+  return abstractView && [abstractView supportsLoadFailed];
 }
 
 extern "C" void webviewRemove(AbstractView *abstractView) {

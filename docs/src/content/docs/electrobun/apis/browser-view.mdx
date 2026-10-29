@@ -280,6 +280,11 @@ The proxy applies to views already using the partition and to views created
 later. Pass `null` to connect directly again. The setting lasts until the app
 quits.
 
+App Transport Security still applies to the URL. On macOS, a bundled app can
+load plain `http` only from `localhost` and IP addresses unless its Info.plist
+has an exception, so names like `feature-a.localhost` need an
+`NSExceptionDomains` entry, which a `postBuild` hook can add.
+
 Session proxies need macOS 14 or later and apply to the native WebKit
 renderer. `Session.supportsProxy` is `false` on older macOS, Linux and
 Windows, and `setProxy()` throws there rather than loading pages without the

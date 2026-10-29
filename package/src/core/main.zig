@@ -3661,6 +3661,17 @@ export fn webviewGetPageZoom(webview_id: u32) f64 {
     return webview_get_page_zoom(webview);
 }
 
+export fn webviewGetStorageIdentifier(webview_id: u32) ?[*:0]const u8 {
+    clearLastError();
+    const WebviewGetStorageIdentifierFn = *const fn (WebviewPtr) callconv(.c) ?[*:0]const u8;
+    const webview = lookupWebviewPtr(webview_id) orelse return null;
+    const webview_get_storage_identifier = lookupNativeSymbol(
+        WebviewGetStorageIdentifierFn,
+        "webviewGetStorageIdentifier",
+    ) orelse return null;
+    return webview_get_storage_identifier(webview);
+}
+
 export fn createWGPUView(
     window_id: u32,
     x: f64,
@@ -4286,17 +4297,36 @@ export fn sessionClearCookies(partition_identifier: [*:0]const u8) void {
     session_clear_cookies(partition_identifier);
 }
 
+// Mirror native/shared/storage_status.h.
+const storage_clear_unsupported_platform: i32 = 2;
+const storage_identifier_unsupported_platform: i32 = 1;
+
+// Returns a StorageClearStatus from native/shared/storage_status.h.
 export fn sessionClearStorageData(
     partition_identifier: [*:0]const u8,
     storage_types_json: [*:0]const u8,
-) void {
+) i32 {
     clearLastError();
-    const SessionClearStorageDataFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) void;
+    const SessionClearStorageDataFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) i32;
     const session_clear_storage_data = lookupNativeSymbol(
         SessionClearStorageDataFn,
         "sessionClearStorageData",
-    ) orelse return;
-    session_clear_storage_data(partition_identifier, storage_types_json);
+    ) orelse return storage_clear_unsupported_platform;
+    return session_clear_storage_data(partition_identifier, storage_types_json);
+}
+
+// Returns a StorageIdentifierStatus from native/shared/storage_status.h.
+export fn sessionSetStorageIdentifier(
+    partition_identifier: [*:0]const u8,
+    identifier: [*:0]const u8,
+) i32 {
+    clearLastError();
+    const SessionSetStorageIdentifierFn = *const fn ([*:0]const u8, [*:0]const u8) callconv(.c) i32;
+    const session_set_storage_identifier = lookupNativeSymbol(
+        SessionSetStorageIdentifierFn,
+        "sessionSetStorageIdentifier",
+    ) orelse return storage_identifier_unsupported_platform;
+    return session_set_storage_identifier(partition_identifier, identifier);
 }
 
 export fn setURLOpenHandler(handler: ?URLOpenHandler) void {

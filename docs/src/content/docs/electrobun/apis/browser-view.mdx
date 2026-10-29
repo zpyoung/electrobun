@@ -243,6 +243,57 @@ While Linux CEF creates its browser, it retains the latest `loadURL()` or
 On macOS, WKWebView uses file-URL loading for local files. `getPageZoom()` reads
 on the main thread after pending initialization and zoom changes.
 
+## Partition storage
+
+`Session.fromPartition(partition)` manages the storage behind a `partition`.
+`clearStorageData()` waits for the native engine to finish removing data and
+returns the outcome. Treat anything other than `"cleared"` as data that may
+still be there:
+
+```ts
+import { Session } from "electrobun/main";
+
+const result = Session.fromPartition("persist:account-a").clearStorageData();
+if (result.status !== "cleared") {
+  console.warn("Storage may remain", result);
+}
+```
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| `cleared` | | The engine reported that removal finished. |
+| `failed` | `timeout` | No completion within 10 seconds. Removal may still finish later. |
+| `failed` | `invalid-types` | The list was empty or named a type the platform can't clear. Nothing was removed. |
+| `unsupported` | `partition` | Only `persist:` partitions can be cleared after creation. |
+| `unsupported` | `platform` | Linux and Windows don't report completion yet, so the data may remain. |
+
+On macOS 14 and later, each `persist:` partition has its own WebKit data
+store, named by a UUID derived from the partition name. To choose the store
+yourself, for example to keep test runs away from a user's data, call
+`setStorageIdentifier()` before creating the first webview for the partition.
+Read `getStorageIdentifier()` on a view to confirm which store it really uses:
+
+```ts
+import { BrowserView, Session } from "electrobun/main";
+
+const session = Session.fromPartition("persist:account-a");
+const assigned = session.setStorageIdentifier(crypto.randomUUID());
+
+const view = new BrowserView({ partition: "persist:account-a" });
+if (assigned.status === "set") {
+  console.log(view.getStorageIdentifier() === assigned.identifier);
+}
+```
+
+`setStorageIdentifier()` returns the identifier in the uppercase form
+`getStorageIdentifier()` reports. It returns `failed` with `in-use` once any
+native webview has used the partition with a different store in this process,
+and `unsupported` on macOS 13 and older, on Linux, on Windows, and for
+partitions without the `persist:` prefix. CEF views ignore the identifier.
+On macOS 13 and older every `persist:` partition shares the default store.
+`getStorageIdentifier()` returns `null` wherever no identifier applies,
+including CEF views. Both are TypeScript-only.
+
 ## Host message queue diagnostics
 
 `getHostMessageQueueStats()` reports the main
@@ -416,6 +467,7 @@ transport; repeated calls are safe.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
   `findInPage`, `stopFindInPage`.
 - Display: `setPageZoom`, `getPageZoom`.
+- Storage: `getStorageIdentifier`.
 - Lifecycle and events: `on`, `remove`, `ptr`.
 - Static ownership: `getById`, `getAll`, `ensureWrapped`, `adoptExisting`, `on`,
   `off`, and `defineRPC`.

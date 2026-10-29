@@ -9,6 +9,12 @@ import {
 } from "../core/BrowserView";
 import { WGPUView } from "../core/WGPUView";
 import {
+	storageClearResult,
+	storageIdentifierResult,
+	type StorageClearResult,
+	type StorageIdentifierResult,
+} from "./sessionStorage";
+import {
 	preloadScript,
 	preloadScriptSandboxed,
 } from "../../../preload/.generated/compiled";
@@ -509,6 +515,10 @@ const core = (() => {
 			webviewGetPageZoom: {
 				args: [FFIType.u32],
 				returns: FFIType.f64,
+			},
+			webviewGetStorageIdentifier: {
+				args: [FFIType.u32],
+				returns: FFIType.cstring,
 			},
 			createWGPUView: {
 				args: [
@@ -1101,7 +1111,11 @@ export const native = (() => {
 			},
 			sessionClearStorageData: {
 				args: [FFIType.cstring, FFIType.cstring],
-				returns: FFIType.void,
+				returns: FFIType.i32,
+			},
+			sessionSetStorageIdentifier: {
+				args: [FFIType.cstring, FFIType.cstring],
+				returns: FFIType.i32,
 			},
 
 			// URL scheme handler (macOS only)
@@ -2270,6 +2284,10 @@ const _ffiImpl = {
 		webviewGetPageZoom: (params: { id: number }): number => {
 			return core_.symbols.webviewGetPageZoom(params.id);
 		},
+		webviewGetStorageIdentifier: (params: { id: number }): string | null => {
+			const identifier = core_.symbols.webviewGetStorageIdentifier(params.id);
+			return identifier ? identifier.toString() : null;
+		},
 		setExitOnLastWindowClosed: (params: { enabled: boolean }) => {
 			core_.symbols.setExitOnLastWindowClosed(params.enabled);
 		},
@@ -3272,6 +3290,8 @@ export interface CookieFilter {
 	session?: boolean;
 }
 
+export type { StorageClearResult, StorageIdentifierResult };
+
 export type StorageType =
 	| "cookies"
 	| "localStorage"
@@ -3354,14 +3374,38 @@ class SessionInstance {
 	}
 
 	/**
-	 * Clear storage data for this session
+	 * Clear storage data for this session and wait for the native engine to
+	 * report that removal finished.
 	 * @param types - Array of storage types to clear, or 'all' to clear everything
+	 * @returns `{ status: "cleared" }` once removal finished. Any other status
+	 * means the data may still be present.
 	 */
-	clearStorageData(types: StorageType[] | "all" = "all"): void {
+	clearStorageData(types: StorageType[] | "all" = "all"): StorageClearResult {
 		const typesArray = types === "all" ? ["all"] : types;
-		native_.symbols.sessionClearStorageData(
-			toCString(this.partition),
-			toCString(JSON.stringify(typesArray)),
+		return storageClearResult(
+			native_.symbols.sessionClearStorageData(
+				toCString(this.partition),
+				toCString(JSON.stringify(typesArray)),
+			),
+		);
+	}
+
+	/**
+	 * Give this persistent partition its own native data store, named by a
+	 * UUID. Call it before creating the first webview for the partition;
+	 * existing webviews keep the store they were created with. Supported on
+	 * macOS 14 and later with the native renderer; CEF views ignore it.
+	 * @param identifier - A UUID string, e.g. from `crypto.randomUUID()`
+	 * @returns On success, the identifier in the uppercase form
+	 * `BrowserView.getStorageIdentifier()` reports
+	 */
+	setStorageIdentifier(identifier: string): StorageIdentifierResult {
+		return storageIdentifierResult(
+			native_.symbols.sessionSetStorageIdentifier(
+				toCString(this.partition),
+				toCString(identifier),
+			),
+			identifier,
 		);
 	}
 }

@@ -88,6 +88,7 @@ export default {
 		"test:release-notes": "node scripts/release-notes-contract.test.mjs",
 		"test:spell-check": "node --test src/shared/spell-check.test.js",
 		"test:macos-spell-check": "scripts/test-macos-spell-check.sh",
+		"test:macos-website-data-store": "scripts/test-macos-website-data-store.sh",
 		"bump-cef": "hutch scripts/update-cef-version.ts",
 	},
 };

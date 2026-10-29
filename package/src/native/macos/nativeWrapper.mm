@@ -29,6 +29,7 @@ static bool wgpuDebugEnabled() {
 #include "../shared/pending_resize_queue.h"
 #include "inspector_layout.h"
 #include "spell_check.h"
+#include "website_data_store.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
 #include <mutex>
@@ -731,39 +732,10 @@ std::string GetScriptExecutionUrl(const std::string &frameUrl) {
   return frameUrl;
 }
 
-NSUUID *UUIDFromString(NSString *string) {
-  unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256(string.UTF8String, (CC_LONG)string.length, hash);
-  uuid_t uuid;
-  memcpy(uuid, hash, sizeof(uuid));
-  return [[NSUUID alloc] initWithUUIDBytes:uuid];
-}
-
 WKWebsiteDataStore *
 createDataStoreForPartition(const char *partitionIdentifier) {
-  NSString *identifier = [NSString stringWithUTF8String:partitionIdentifier];
-  if ([identifier hasPrefix:@"persist:"]) {
-    // persistent
-    identifier = [identifier substringFromIndex:8];
-    NSUUID *uuid = UUIDFromString(identifier);
-    if (uuid) {
-      // dataStoreForIdentifier is only available on macOS 14.0+
-      if (@available(macOS 14.0, *)) {
-        return [WKWebsiteDataStore dataStoreForIdentifier:uuid];
-      } else {
-        // Fallback to default data store on older macOS versions
-        NSLog(@"[Session] Partition-specific data stores require macOS 14.0+, "
-              @"using default store");
-        return [WKWebsiteDataStore defaultDataStore];
-      }
-    } else {
-      NSLog(@"Invalid UUID for identifier: %@", identifier);
-      return [WKWebsiteDataStore defaultDataStore];
-    }
-  } else {
-    // ephemeral
-    return [WKWebsiteDataStore nonPersistentDataStore];
-  }
+  return electrobun::PartitionDataStores::shared().dataStoreForPartition(
+      [NSString stringWithUTF8String:partitionIdentifier]);
 }
 
 static NSString *normalizeViewsRelativePath(NSString *urlString) {
@@ -3015,6 +2987,12 @@ static void schedulePendingResizeDrain() {
     NSString *viewsRootString = (viewsRoot && strlen(viewsRoot) > 0)
                                     ? [NSString stringWithUTF8String:viewsRoot]
                                     : nil;
+    // the caller frees partitionIdentifier once this returns, so the async
+    // block below must not read it.
+    NSString *partitionString =
+        [NSString stringWithUTF8String:partitionIdentifier];
+    electrobun::PartitionDataStores::shared().noteWebviewCreated(
+        partitionString);
 
     // TODO: rewrite this so we can return a reference to the AbstractRenderer
     // and then call init from zig after the handle is added to the webviewMap
@@ -3025,7 +3003,7 @@ static void schedulePendingResizeDrain() {
           [[WKWebViewConfiguration alloc] init];
 
       configuration.websiteDataStore =
-          createDataStoreForPartition(partitionIdentifier);
+          createDataStoreForPartition([partitionString UTF8String]);
 
       [configuration.preferences setValue:@YES
                                    forKey:@"developerExtrasEnabled"];
@@ -11033,68 +11011,62 @@ extern "C" void sessionClearCookies(const char *partitionIdentifier) {
       });
 }
 
-// Clear all storage data for a partition (WKWebView)
-// storageTypesJson: ["cookies", "localStorage", "sessionStorage", "indexedDB",
-// "cache"] or null for all
-extern "C" void sessionClearStorageData(const char *partitionIdentifier,
-                                        const char *storageTypesJson) {
+// Clear storage data for a partition (WKWebView)
+// storageTypesJson: ["all"] or any of ["cookies", "localStorage",
+// "sessionStorage", "indexedDB", "cache", "serviceWorkers"]
+// Returns an electrobun::StorageClearStatus.
+extern "C" int32_t sessionClearStorageData(const char *partitionIdentifier,
+                                           const char *storageTypesJson) {
   NSString *partitionStr =
       partitionIdentifier ? [NSString stringWithUTF8String:partitionIdentifier]
                           : @"";
   NSString *typesStr =
       storageTypesJson ? [NSString stringWithUTF8String:storageTypesJson] : @"";
 
-  waitForMainThreadAsyncCompletion(
+  __block int32_t status = electrobun::StorageClearTimedOut;
+  bool completed = waitForMainThreadAsyncCompletion(
       10 * NSEC_PER_SEC, ^(dispatch_semaphore_t completionSemaphore) {
         @autoreleasepool {
-          WKWebsiteDataStore *dataStore =
-              createDataStoreForPartition([partitionStr UTF8String]);
-
-          NSMutableSet *dataTypes = [NSMutableSet set];
-
-          if (typesStr.length > 0) {
-            NSData *jsonData =
-                [typesStr dataUsingEncoding:NSUTF8StringEncoding];
-            NSArray *types = [NSJSONSerialization JSONObjectWithData:jsonData
-                                                             options:0
-                                                               error:nil];
-
-            for (NSString *type in types) {
-              if ([type isEqualToString:@"cookies"]) {
-                [dataTypes addObject:WKWebsiteDataTypeCookies];
-              } else if ([type isEqualToString:@"localStorage"]) {
-                [dataTypes addObject:WKWebsiteDataTypeLocalStorage];
-              } else if ([type isEqualToString:@"sessionStorage"]) {
-                [dataTypes addObject:WKWebsiteDataTypeSessionStorage];
-              } else if ([type isEqualToString:@"indexedDB"]) {
-                [dataTypes addObject:WKWebsiteDataTypeIndexedDBDatabases];
-              } else if ([type isEqualToString:@"cache"]) {
-                [dataTypes addObject:WKWebsiteDataTypeDiskCache];
-                [dataTypes addObject:WKWebsiteDataTypeMemoryCache];
-              } else if ([type isEqualToString:@"serviceWorkers"]) {
-                [dataTypes
-                    addObject:WKWebsiteDataTypeServiceWorkerRegistrations];
-              }
-            }
-          } else {
-            dataTypes = [NSMutableSet
-                setWithSet:[WKWebsiteDataStore allWebsiteDataTypes]];
-          }
-
-          if (dataTypes.count == 0) {
-            dispatch_semaphore_signal(completionSemaphore);
-            return;
-          }
-
-          NSDate *dateFrom = [NSDate dateWithTimeIntervalSince1970:0];
-
-          [dataStore removeDataOfTypes:dataTypes
-                         modifiedSince:dateFrom
-                     completionHandler:^{
-                       dispatch_semaphore_signal(completionSemaphore);
-                     }];
+          electrobun::clearPartitionWebsiteData(
+              partitionStr, typesStr,
+              ^(electrobun::StorageClearStatus clearStatus) {
+                status = clearStatus;
+                dispatch_semaphore_signal(completionSemaphore);
+              });
         }
       });
+  return completed ? status : electrobun::StorageClearTimedOut;
+}
+
+// Assign the WKWebsiteDataStore identifier a persist: partition uses. Must be
+// called before the first webview for the partition is created.
+// Returns an electrobun::StorageIdentifierStatus.
+extern "C" int32_t sessionSetStorageIdentifier(const char *partitionIdentifier,
+                                               const char *identifier) {
+  NSString *partitionStr =
+      partitionIdentifier ? [NSString stringWithUTF8String:partitionIdentifier]
+                          : @"";
+  NSString *identifierStr =
+      identifier ? [NSString stringWithUTF8String:identifier] : nil;
+  return electrobun::PartitionDataStores::shared().assignIdentifier(
+      partitionStr, identifierStr);
+}
+
+// The identifier of the data store a native webview was created with, or
+// NULL for CEF views, non-persistent partitions and macOS before 14.
+extern "C" const char *webviewGetStorageIdentifier(AbstractView *abstractView) {
+  __block char *result = NULL;
+  runOnMainThreadSyncVoid(^{
+    if ([abstractView isKindOfClass:[WKWebViewImpl class]]) {
+      WKWebViewImpl *wkImpl = (WKWebViewImpl *)abstractView;
+      NSString *identifier = electrobun::dataStoreIdentifierString(
+          wkImpl.webView.configuration.websiteDataStore);
+      if (identifier) {
+        result = strdup([identifier UTF8String]);
+      }
+    }
+  });
+  return result;
 }
 
 // Window icon - Linux only, no-op for macOS (macOS uses app bundle icon)

@@ -12,5 +12,7 @@ export type {
 	MenuItemConfig,
 	Point,
 	Rectangle,
+	StorageClearResult,
+	StorageIdentifierResult,
 	StorageType,
 } from "../proc/native";

@@ -110,6 +110,7 @@ describe("cache-bypassing reload and load-failed contract", () => {
 		expect(sources.typescript).toContain('"load-failed": "loadFailed",');
 		expect(sources.typescript).toContain('eventName === "load-failed"\n\t) {\n\t\ttry {\n\t\t\tparsedDetail = JSON.parse(detail);');
 		expect(sources.core).toContain('std.mem.eql(u8, event_name_slice, "load-failed"))');
+		expect(sources.core).toContain('if (std.mem.eql(u8, event_name, "load-failed")) return false;');
 
 		const detail = {
 			url: "http://127.0.0.1:9/",

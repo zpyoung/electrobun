@@ -29,6 +29,19 @@ describe("parseWebviewEventBridgeMessage", () => {
 		).toBeNull();
 	});
 
+	it("refuses native-only events sent by a page", () => {
+		expect(
+			parseWebviewEventBridgeMessage(
+				5,
+				JSON.stringify({
+					id: "webviewEvent",
+					type: "message",
+					payload: { id: 5, eventName: "load-failed", detail: "{}" },
+				}),
+			),
+		).toBeNull();
+	});
+
 	it("keeps hostile detail as inert string data", () => {
 		const detail = 'null); globalThis.pwned = "yes"; //';
 		expect(parseWebviewEventBridgeMessage(4, eventMessage(4, detail))).toEqual({

@@ -2571,7 +2571,9 @@ fn isValidEventBridgeMessage(source_webview_id: u32, message: []const u8) bool {
     const payload_object = payload.object;
     const claimed_webview_id = jsonU32(payload_object.get("id") orelse return false) orelse return false;
     if (claimed_webview_id != source_webview_id) return false;
-    if (jsonString(payload_object.get("eventName") orelse return false) == null) return false;
+    const event_name = jsonString(payload_object.get("eventName") orelse return false) orelse return false;
+    // Only the native wrapper reports load failures, so a page can't forge one.
+    if (std.mem.eql(u8, event_name, "load-failed")) return false;
     if (jsonString(payload_object.get("detail") orelse return false) == null) return false;
     return true;
 }
@@ -4523,6 +4525,10 @@ test "event bridge requires the native sender identity" {
     try std.testing.expect(!isValidEventBridgeMessage(
         17,
         "{\"id\":\"webviewEvent\",\"type\":\"message\",\"payload\":{\"id\":17,\"eventName\":42,\"detail\":\"invalid\"}}",
+    ));
+    try std.testing.expect(!isValidEventBridgeMessage(
+        17,
+        "{\"id\":\"webviewEvent\",\"type\":\"message\",\"payload\":{\"id\":17,\"eventName\":\"load-failed\",\"detail\":\"{}\"}}",
     ));
 }
 

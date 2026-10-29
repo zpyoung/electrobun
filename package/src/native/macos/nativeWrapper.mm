@@ -27,6 +27,7 @@ static bool wgpuDebugEnabled() {
   return cached == 1;
 }
 #include "../shared/pending_resize_queue.h"
+#include "drop_source_paths.h"
 #include "inspector_layout.h"
 #include "spell_check.h"
 #import <UserNotifications/UserNotifications.h>
@@ -966,6 +967,7 @@ void releaseObjCObject(id objcObject) {
 - (void)toggleMirrorMode:(BOOL)enable;
 - (BOOL)shouldSuppressMirrorMode;
 - (BOOL)setSpellCheck:(BOOL)enabled;
+- (BOOL)supportsDropSourcePaths;
 
 - (BOOL)canGoBack;
 - (BOOL)canGoForward;
@@ -1538,6 +1540,10 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 
 - (BOOL)setSpellCheck:(BOOL)enabled {
   (void)enabled;
+  return NO;
+}
+
+- (BOOL)supportsDropSourcePaths {
   return NO;
 }
 
@@ -3050,8 +3056,17 @@ static void schedulePendingResizeDrain() {
                             forURLScheme:@"appdata"];
 
       // create WKWebView
-      self.webView = [[WKWebView alloc] initWithFrame:frame
-                                        configuration:configuration];
+      ElectrobunWKWebView *webView =
+          [[ElectrobunWKWebView alloc] initWithFrame:frame
+                                       configuration:configuration];
+      webView.dropSourcePathsHandler = ^(NSArray<NSString *> *paths) {
+        NSString *detail = electrobun::dropSourcePathsEventDetail(paths);
+        if (webviewEventHandler && detail) {
+          webviewEventHandler(webviewId, strdup("drop-source-paths"),
+                              strdup([detail UTF8String]));
+        }
+      };
+      self.webView = webView;
 
       // Only set transparent background for main window webviews
       // (autoResize/fullscreen) Child webviews (OOPIFs) need a visible
@@ -3274,6 +3289,10 @@ static void schedulePendingResizeDrain() {
   if (navigationDelegate.hasFinishedNavigation) {
     return electrobun::setContinuousSpellChecking(self.webView, enabled);
   }
+  return YES;
+}
+
+- (BOOL)supportsDropSourcePaths {
   return YES;
 }
 
@@ -8871,6 +8890,10 @@ extern "C" bool webviewSetSpellCheck(AbstractView *abstractView, bool enabled) {
   return runOnMainThreadSyncBool(^bool {
     return [abstractView setSpellCheck:enabled ? YES : NO] == YES;
   });
+}
+
+extern "C" bool webviewSupportsDropSourcePaths(AbstractView *abstractView) {
+  return abstractView && [abstractView supportsDropSourcePaths];
 }
 
 extern "C" void setWebviewNavigationRules(AbstractView *abstractView,

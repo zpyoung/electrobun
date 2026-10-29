@@ -323,8 +323,34 @@ stopWatchingCreatedViews();
 
 Supported instance event names are `will-navigate`, `did-navigate`,
 `did-navigate-in-page`, `did-commit-navigation`, `dom-ready`,
-`download-started`, `download-progress`, `download-completed`, and
-`download-failed`.
+`download-started`, `download-progress`, `download-completed`,
+`download-failed`, and `drop-source-paths`.
+
+### Dropped file paths
+
+When the user drops files from Finder or another app onto a view, the page gets
+the usual DOM `drop` event, whose `File` objects carry names and contents but no
+paths. `drop-source-paths` gives the main process the original absolute paths
+of the same drop, in the order the page sees the files.
+
+```ts
+if (win.webview.supportsDropSourcePaths()) {
+  win.webview.on("drop-source-paths", (event: unknown) => {
+    const { paths } = (event as { data: { detail: { paths: string[] } } }).data
+      .detail;
+    console.log("Dropped from disk", paths);
+  });
+}
+```
+
+The event fires once per drop that the view accepted, and only when the drop
+holds file URLs. Text, web links and file promises (for example a mail
+attachment) don't produce it. A page can't send this event itself: it is only
+accepted from the native wrapper.
+
+`supportsDropSourcePaths()` returns `true` for the native renderer on macOS. It
+returns `false` for CEF views and on Linux and Windows, where the event never
+fires. Native SDKs receive the event through the webview `event` callback.
 
 ## Typed RPC
 
@@ -412,7 +438,7 @@ transport; repeated calls are safe.
 ## Public methods
 
 - Content: `loadURL`, `loadHTML`, `executeJavascript`, `setNavigationRules`,
-  `setSpellCheck`.
+  `setSpellCheck`, `supportsDropSourcePaths`.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
   `findInPage`, `stopFindInPage`.
 - Display: `setPageZoom`, `getPageZoom`.

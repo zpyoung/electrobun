@@ -9709,6 +9709,12 @@ ELECTROBUN_EXPORT bool webviewSetSpellCheck(AbstractView* abstractView, bool ena
     return false;
 }
 
+ELECTROBUN_EXPORT bool webviewSupportsDropSourcePaths(AbstractView* abstractView) {
+    (void)abstractView;
+    // Dropped-file source paths are only wired for macOS WKWebView, not WebKitGTK or CEF.
+    return false;
+}
+
 ELECTROBUN_EXPORT void setWebviewNavigationRules(AbstractView* abstractView, const char* rulesJson) {
     if (abstractView) {
         std::string rulesStr(rulesJson ? rulesJson : "");  // Copy the string to ensure it survives

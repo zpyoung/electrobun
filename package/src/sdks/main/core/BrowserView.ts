@@ -306,6 +306,14 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		return ffi.request.webviewSetSpellCheck({ id: this.id, enabled });
 	}
 
+	/**
+	 * Whether this view emits `drop-source-paths` for native file drops.
+	 * True for macOS WKWebView; false for CEF and on Linux and Windows.
+	 */
+	supportsDropSourcePaths(): boolean {
+		return ffi.request.webviewSupportsDropSourcePaths({ id: this.id });
+	}
+
 	findInPage(
 		searchText: string,
 		options?: { forward?: boolean; matchCase?: boolean },
@@ -366,7 +374,8 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			| "download-started"
 			| "download-progress"
 			| "download-completed"
-			| "download-failed",
+			| "download-failed"
+			| "drop-source-paths",
 		handler: (event: unknown) => void,
 	) {
 		const specificName = `${name}-${this.id}`;

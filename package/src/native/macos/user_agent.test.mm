@@ -56,7 +56,10 @@ static int failures = 0;
             if (client < 0) {
                 return;
             }
-            [self handleClient:client];
+            // WebKit can open a connection it never sends on; serving it inline would stall the next request.
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                [self handleClient:client];
+            });
         }
     }];
     return YES;
@@ -164,9 +167,10 @@ static NSString *readUserAgentSync(WKWebView *webView)
 static bool loadPath(WKWebView *webView, UserAgentNavigationProbe *probe, UserAgentRecordingServer *server, NSString *path)
 {
     NSUInteger expected = probe.finishedCount + 1;
+    NSUInteger failuresBefore = probe.failedCount;
     NSString *url = [NSString stringWithFormat:@"http://127.0.0.1:%u%@", server.port, path];
     [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:url]]];
-    return spinUntil(^bool { return probe.finishedCount >= expected || probe.failedCount > 0; }) &&
+    return spinUntil(^bool { return probe.finishedCount >= expected || probe.failedCount > failuresBefore; }) &&
         probe.finishedCount >= expected;
 }
 

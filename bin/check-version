@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Refuse any release tag that isn't v<x.y.z>-quirky.<N>, N >= 1, or that disagrees with the package
+# version. Private test versions (<x.y.z>-quirky.0-<patch>) fail here by design.
+# Usage: check-version <tag> [package.json]
+set -euo pipefail
+tag="${1:?usage: check-version <tag> [package.json]}"
+pkg="${2:-package/package.json}"
+
+if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-quirky\.[1-9][0-9]*$ ]]; then
+  echo "error: $tag isn't a release version (v<x.y.z>-quirky.<N>, N >= 1)" >&2
+  exit 1
+fi
+version="$(node -p 'require(process.argv[1]).version' "$(cd "$(dirname "$pkg")" && pwd)/$(basename "$pkg")")"
+if [ "v$version" != "$tag" ]; then
+  echo "error: tag $tag doesn't match package version $version" >&2
+  exit 1
+fi

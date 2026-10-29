@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Build a private test devkit from the current patch worktree: the base tag plus this one patch,
+# versioned <base>-quirky.0-<name> so it can never be released or mistaken for upstream.
+# Run from a patch/<name> worktree. Prints the Quirky pin and devkit root to use.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+branch="$(git -C "$root" symbolic-ref --short HEAD)"
+[[ "$branch" == patch/* ]] || { echo "error: run this from a patch/<name> worktree (on $branch)" >&2; exit 1; }
+name="${branch#patch/}"
+pkg="$root/package/package.json"
+git -C "$root" diff --quiet -- package/package.json package/package-lock.json \
+  || { echo "error: package.json has uncommitted changes" >&2; exit 1; }
+
+base_version="$(node -p 'require(process.argv[1]).version' "$pkg")"
+version="${base_version}-quirky.0-${name}"
+
+restore() { git -C "$root" checkout -q -- package/package.json package/package-lock.json; }
+trap restore EXIT
+(cd "$root/package" && QV="$version" node -e '
+  const fs = require("fs")
+  for (const f of ["package.json", "package-lock.json"]) {
+    const j = JSON.parse(fs.readFileSync(f, "utf8"))
+    j.version = process.env.QV
+    if (j.packages && j.packages[""]) j.packages[""].version = process.env.QV
+    fs.writeFileSync(f, JSON.stringify(j, null, "\t") + "\n")
+  }')
+
+cd "$root/package"
+[ -d node_modules ] || hutch run install
+hutch build.ts --release --core-only --arch=arm64
+
+cat <<EOF
+
+Private test devkit $version built.
+In the paired Quirky worktree (don't commit the pin change):
+  apps/desktop/hutch.config.ts   electrobun: { version: '$version' }
+  export HUTCH_ELECTROBUN_DEVKIT_ROOT=$root/package/dist
+EOF

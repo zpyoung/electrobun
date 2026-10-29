@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Tag the unified build v<base>-quirky.N and push the patch branches, the unified branch, the
+# tooling branch and the tag. The quirky-release workflow builds and publishes from the tag.
+source "$(dirname "$0")/lib.sh"
+
+[ ! -f "$STATE" ] || die "a rebuild is paused; finish it first"
+[ ! -d "$LOCK" ] || die "the fork lock is held by $(cat "$LOCK/owner" 2>/dev/null)"
+base="$(base_tag)"
+[ "$(git -C "$WORK" symbolic-ref --short HEAD)" = "unified/$base" ] || die "$WORK isn't on unified/$base"
+[ -z "$(git -C "$WORK" status --porcelain)" ] || die "$WORK has uncommitted changes"
+case "$(git -C "$WORK" log -1 --format=%s)" in
+  "unified: release "*) ;;
+  *) die "unified/$base doesn't end in a release commit; run bin/rebuild" ;;
+esac
+[ -z "$(git -C "$TOOLS" status --porcelain -- patches.txt rr-cache)" ] || die "commit patches.txt and rr-cache first"
+
+version="$(node -p 'require(process.argv[1]).version' "$WORK/package/package.json")"
+tag="v$version"
+"$TOOLS/bin/check-version" "$tag" "$WORK/package/package.json"
+! git -C "$TOOLS" rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "$tag already exists"
+
+branches=()
+while IFS=$'\t' read -r branch _; do branches+=("$branch"); done < <(patch_lines)
+
+git -C "$WORK" tag -a "$tag" -m "Quirky Electrobun $version"
+git -C "$TOOLS" push origin quirky "${branches[@]}"
+git -C "$TOOLS" push --force-with-lease origin "unified/$base"
+git -C "$TOOLS" push origin "$tag"
+echo "pushed $tag; watch: gh run list -R zpyoung/electrobun -w quirky-release"

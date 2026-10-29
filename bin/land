@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Add a finished patch to patches.txt and rebuild the unified build.
+# Usage: land patch/<name> '<test command run from the repo root>'
+source "$(dirname "$0")/lib.sh"
+
+branch="${1:-}"
+test_cmd="${2:-}"
+[[ "$branch" == patch/* ]] && [ -n "$test_cmd" ] || die "usage: land patch/<name> '<test command>'"
+git -C "$TOOLS" rev-parse -q --verify "refs/heads/$branch" >/dev/null || die "no local branch $branch"
+git -C "$TOOLS" merge-base --is-ancestor "$(base_tag)" "$branch" || die "$branch isn't based on $(base_tag)"
+
+lock_acquire "land $branch"
+if patch_lines | cut -f1 | grep -qx "$branch"; then
+  lock_release
+  die "$branch is already in patches.txt"
+fi
+printf '%s %s\n' "$branch" "$test_cmd" >> "$PATCHES"
+state_set landing "$branch"
+QUIRKY_LOCK_HELD=1 "$TOOLS/bin/rebuild"

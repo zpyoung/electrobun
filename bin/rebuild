@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Regenerate unified/<base>: the base tag, each patch in patches.txt merged in order, then a release
+# commit. Usage: rebuild [<base-tag>] | --continue | --abort
+source "$(dirname "$0")/lib.sh"
+
+mode=fresh
+arg_base=""
+case "${1:-}" in
+  --continue) mode=continue ;;
+  --abort) mode=abort ;;
+  v*) arg_base="$1" ;;
+  "") ;;
+  *) die "usage: rebuild [<base-tag>] | --continue | --abort" ;;
+esac
+
+abort() {
+  [ -f "$STATE" ] || die "no paused rebuild"
+  git -C "$WORK" merge --abort 2>/dev/null || true
+  local landing; landing="$(state_get landing)"
+  if [ -n "$landing" ]; then
+    git -C "$TOOLS" checkout -q -- patches.txt
+    echo "removed $landing from patches.txt"
+  fi
+  rm -f "$STATE"
+  lock_release
+  echo "rebuild aborted"
+}
+
+next_version() {
+  local base="$1" n=0 t
+  git -C "$TOOLS" fetch -q origin --tags 2>/dev/null || true
+  for t in $(git -C "$TOOLS" tag -l "${base}-quirky.*"); do
+    t="${t#"${base}"-quirky.}"
+    [[ "$t" =~ ^[1-9][0-9]*$ ]] && [ "$t" -gt "$n" ] && n="$t"
+  done
+  echo "${base#v}-quirky.$((n + 1))"
+}
+
+reset_work() {
+  local base="$1"
+  if [ -d "$WORK" ]; then
+    git -C "$WORK" merge --abort 2>/dev/null || true
+    git -C "$WORK" reset -q --hard
+    git -C "$WORK" clean -fdq
+    git -C "$WORK" checkout -q -B "unified/$base" "$base"
+  else
+    git -C "$TOOLS" worktree add -q -B "unified/$base" "$WORK" "$base"
+  fi
+}
+
+patch_ref() {
+  if git -C "$TOOLS" rev-parse -q --verify "refs/heads/$1" >/dev/null; then echo "refs/heads/$1"
+  elif git -C "$TOOLS" rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null; then echo "refs/remotes/origin/$1"
+  else die "patch branch $1 not found"; fi
+}
+
+unmerged() { git -C "$WORK" diff --name-only --diff-filter=U; }
+
+merge_patches() {
+  local i=0 next branch test ref
+  next="$(state_get next)"
+  while IFS=$'\t' read -r branch test; do
+    if [ "$i" -lt "$next" ]; then i=$((i + 1)); continue; fi
+    [ -n "$test" ] || die "$branch has no test command in patches.txt"
+    ref="$(patch_ref "$branch")"
+    if ! git -C "$WORK" merge -q --no-ff --no-edit -m "unified: merge $branch" "$ref"; then
+      if [ -z "$(unmerged)" ]; then
+        git -C "$WORK" commit -q --no-edit
+      else
+        state_set next "$i"
+        state_set paused "$branch"
+        echo
+        echo "$branch conflicts with a patch listed before it. Resolve it in:"
+        echo "  $WORK"
+        echo "then run: git -C $WORK commit --no-edit && $TOOLS/bin/rebuild --continue"
+        echo "or back out: $TOOLS/bin/rebuild --abort"
+        unmerged | sed 's/^/  conflict: /'
+        exit 2
+      fi
+    fi
+    i=$((i + 1))
+    state_set next "$i"
+  done < <(patch_lines)
+}
+
+release_commit() {
+  local base="$1" version="$2"
+  (cd "$WORK" && QV="$version" node -e '
+    const fs = require("fs")
+    for (const f of ["package/package.json", "package/package-lock.json"]) {
+      const j = JSON.parse(fs.readFileSync(f, "utf8"))
+      j.version = process.env.QV
+      if (j.packages && j.packages[""]) j.packages[""].version = process.env.QV
+      fs.writeFileSync(f, JSON.stringify(j, null, "\t") + "\n")
+    }')
+  # upstream's release.yml also matches v* tags, so the unified build carries only our workflow
+  (cd "$WORK" && git rm -q .github/workflows/*.yml)
+  mkdir -p "$WORK/quirky/bin" "$WORK/.github/workflows"
+  cp "$PATCHES" "$WORK/quirky/patches.txt"
+  cp "$TOOLS/bin/run-patch-tests" "$TOOLS/bin/check-version" "$WORK/quirky/bin/"
+  cp "$TOOLS/workflows/quirky-release.yml" "$WORK/.github/workflows/"
+  git -C "$WORK" add -A
+  git -C "$WORK" commit -q -m "unified: release $version"
+}
+
+save_tooling() {
+  mkdir -p "$TOOLS/rr-cache"
+  [ -d "$COMMON/rr-cache" ] && cp -R "$COMMON/rr-cache/." "$TOOLS/rr-cache/"
+  git -C "$TOOLS" add patches.txt rr-cache
+  local landing; landing="$(state_get landing)"
+  if [ -n "$landing" ] && [ -f "$TOOLS/prs/${landing#patch/}.md" ]; then
+    git -C "$TOOLS" add "prs/${landing#patch/}.md"
+  fi
+  if ! git -C "$TOOLS" diff --cached --quiet; then
+    git -C "$TOOLS" commit -q -m "${landing:+land $landing; }rebuild $(state_get base)"
+  fi
+}
+
+[ "$mode" = abort ] && { abort; exit 0; }
+
+if [ "$mode" = continue ]; then
+  [ -f "$STATE" ] || die "no paused rebuild"
+  [ -z "$(unmerged)" ] || die "unresolved conflicts remain in $WORK"
+  if git -C "$WORK" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git -C "$WORK" commit -q --no-edit
+  fi
+  state_set next "$(( $(state_get next) + 1 ))"
+  state_set paused ""
+else
+  if [ -z "${QUIRKY_LOCK_HELD:-}" ]; then lock_acquire "rebuild"; fi
+  [ ! -f "$STATE" ] || [ -n "${QUIRKY_LOCK_HELD:-}" ] || die "a rebuild is paused; run --continue or --abort"
+  base="${arg_base:-$(base_tag)}"
+  [ -n "$base" ] || die "patches.txt has no '# base vX.Y.Z' line"
+  git -C "$TOOLS" rev-parse -q --verify "refs/tags/$base" >/dev/null || git -C "$TOOLS" fetch -q upstream tag "$base"
+  sed -i '' -E "s/^# base v[0-9.]+$/# base $base/" "$PATCHES"
+  state_set base "$base"
+  state_set version "$(next_version "$base")"
+  state_set next 0
+  mkdir -p "$COMMON/rr-cache"
+  [ -d "$TOOLS/rr-cache" ] && cp -R "$TOOLS/rr-cache/." "$COMMON/rr-cache/"
+  reset_work "$base"
+fi
+
+base="$(state_get base)"
+version="$(state_get version)"
+merge_patches
+release_commit "$base" "$version"
+save_tooling
+rm -f "$STATE"
+lock_release
+echo "unified/$base rebuilt as $version at $WORK"

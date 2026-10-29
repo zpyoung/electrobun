@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Run a memory-heavy command (devkit build, typecheck, test suite) in one of a few machine-wide
+# slots, so parallel item sessions don't exhaust this Mac. Usage: heavy <command> [args...]
+set -euo pipefail
+[ "$#" -gt 0 ] || { echo "usage: heavy <command> [args...]" >&2; exit 1; }
+
+slots="${QUIRKY_HEAVY_SLOTS:-3}"
+dir="$HOME/.cache/quirky-heavy"
+mkdir -p "$dir"
+
+slot=""
+waited=0
+while [ -z "$slot" ]; do
+  for i in $(seq 1 "$slots"); do
+    if mkdir "$dir/slot-$i" 2>/dev/null; then
+      slot="$dir/slot-$i"
+      break
+    fi
+    pid="$(cat "$dir/slot-$i/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$dir/slot-$i"; fi
+  done
+  if [ -z "$slot" ]; then
+    [ $((waited % 60)) -eq 0 ] && echo "heavy: all $slots slots busy, waiting" >&2
+    sleep 5
+    waited=$((waited + 5))
+  fi
+done
+
+echo $$ > "$slot/pid"
+echo "$PWD: $*" > "$slot/cmd"
+trap 'rm -rf "$slot"' EXIT
+"$@"

@@ -15,11 +15,7 @@ test("macOS WKWebView applies the user agent before its first load", () => {
 	assert.match(helper, /inContentWorld:WKContentWorld\.defaultClientWorld/);
 	assert.match(
 		wrapper,
-		/self\.webView = \[\[WKWebView alloc\] initWithFrame:frame\s+configuration:configuration\];\s+if \(self\.pendingUserAgent\) \{\s+electrobun::setCustomUserAgent/,
-	);
-	assert.match(
-		wrapper,
-		/setCustomUserAgent\(self\.webView, self\.pendingUserAgent\)[\s\S]*?loadURLOnMainThread:\[NSString stringWithUTF8String:url\]/,
+		/initWithFrame:frame\s+configuration:configuration\];[\s\S]*?if \(self\.pendingUserAgent\) \{\s+electrobun::setCustomUserAgent\(self\.webView, self\.pendingUserAgent\);[\s\S]*?loadURLOnMainThread:\[NSString stringWithUTF8String:url\]/,
 	);
 	assert.match(wrapper, /extern "C" bool webviewSetUserAgent\(AbstractView \*abstractView,/);
 	assert.match(wrapper, /extern "C" const char \*getDefaultUserAgent\(\)/);

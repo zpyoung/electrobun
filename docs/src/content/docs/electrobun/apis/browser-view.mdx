@@ -183,6 +183,7 @@ The constructor accepts `Partial<BrowserViewOptions>`.
 | `startTransparent` | `boolean` | `false` | Create the native layer transparent. |
 | `startPassthrough` | `boolean` | `false` | Create with input passthrough enabled. |
 | `spellCheck` | `boolean` | `false` | Enable native spell checking where supported. |
+| `popupRequestId` | `number` | none | Adopt the popup from a `popup-request` event. See [Native page requests](#native-page-requests). |
 
 <Aside type="note">
 Use the DOM `<electrobun-webview>` element when the view's bounds should follow
@@ -323,8 +324,110 @@ stopWatchingCreatedViews();
 
 Supported instance event names are `will-navigate`, `did-navigate`,
 `did-navigate-in-page`, `did-commit-navigation`, `dom-ready`,
-`download-started`, `download-progress`, `download-completed`, and
-`download-failed`.
+`download-started`, `download-progress`, `download-completed`,
+`download-failed`, `close-requested`, and the request events listed under
+[Native page requests](#native-page-requests).
+
+Download events carry an `id` that stays the same from `download-started`
+through `download-completed` or `download-failed`. `download-progress` reports
+`receivedBytes` and `totalBytes` (`-1` when the size is unknown) alongside the
+percentage, and `download-failed` sets `cancelled: true` for a cancelled
+download. `close-requested` fires when the page calls `window.close()`; the app
+decides whether to remove the view.
+
+## Native page requests
+
+Some page actions wait for an answer: `alert()`, `confirm()` and `prompt()`,
+HTTP authentication, an untrusted TLS certificate, where to save a download, a
+popup, and a link to another application. By default the renderer answers them
+itself. `setNativeRequestHandling()` hands the chosen kinds to the app instead.
+Each one arrives as an event whose detail has a `requestId`, and the page stays
+paused until the app calls `respondToNativeRequest()`.
+
+```ts
+import { BrowserView } from "electrobun/main";
+
+const view = BrowserView.getById(webviewId)!;
+const supported = view.setNativeRequestHandling(
+  ["dialogs", "auth", "certificates", "downloads", "popups", "externalApps"],
+  { timeoutMs: 120_000 },
+);
+if (!supported) console.log("Native page requests are unavailable here");
+
+view.on("dialog-request", (event: any) => {
+  const { requestId, type, message, origin } = event.data.detail;
+  // Show your own UI naming `origin`, then answer:
+  view.respondToNativeRequest(requestId, { accept: true, text: "Ada" });
+});
+view.on("native-request-expired", (event: any) => {
+  // Close any UI still showing for event.data.detail.requestId.
+});
+```
+
+| Kind | Event | Detail | Accepted with | Unanswered or declined |
+| --- | --- | --- | --- | --- |
+| `dialogs` | `dialog-request` | `type` (`alert`, `confirm`, `prompt`), `message`, `defaultText`, `origin`, `frameUrl`, `isMainFrame` | `{ accept: true, text }`; `text` is the `prompt()` result | `alert()` returns, `confirm()` returns `false`, `prompt()` returns `null` |
+| `auth` | `auth-request` | `origin`, `host`, `port`, `protocol`, `realm`, `authenticationMethod`, `isProxy`, `previousFailureCount` | `{ accept: true, username, password }` | the challenge is cancelled |
+| `certificates` | `certificate-request` | `origin`, `host`, `port`, `protocol`, `error` | `{ accept: true }` trusts the certificate for this challenge | the connection fails |
+| `downloads` | `download-request` | `downloadId`, `url`, `suggestedFilename`, `mimeType`, `expectedBytes`, `origin` | `{ accept: true, path }` with an absolute path | the download is cancelled |
+| `popups` | `popup-request` | `url`, `method`, `windowFeatures`, `origin` | create a `BrowserView` with `popupRequestId` | the popup closes before it loads |
+| `externalApps` | `external-app-request` | `url`, `scheme`, `isUserGesture`, `origin` | `{ accept: true }` opens the URL with the system handler | nothing opens |
+
+A request left unanswered for `timeoutMs` (120 seconds by default) takes the
+right-hand column and emits `native-request-expired` with `reason: "timeout"`.
+Removing the view does the same with `reason: "closed"`. Each request accepts
+one answer: `respondToNativeRequest()` returns `false` for an unknown,
+answered, expired, or other view's request.
+
+Certificate requests only fire for certificates the system does not trust.
+Credentials from an auth answer are used for that challenge only and are never
+stored. A download path that already exists is numbered (`report (1).pdf`);
+`download-started` reports the final path, and a relative path or a missing
+directory cancels the download. Cancel an active download with
+`cancelDownload(id)`.
+
+External-app requests cover URLs the webview cannot load itself: schemes
+WebKit does not handle and that have no registered scheme handler, such as
+`mailto:` or `zoommtg:`. The navigation is cancelled immediately, so the page
+stays where it was.
+
+### Popups
+
+The popup is created by the renderer from the opener's configuration, so
+`window.opener`, the target window name, and a form's POST body all survive.
+Its first navigation is held until the app adopts it:
+
+```ts
+import { BrowserView, BrowserWindow } from "electrobun/main";
+
+view.on("popup-request", (event: any) => {
+  const { requestId, url, windowFeatures } = event.data.detail;
+  const popupWindow = new BrowserWindow({
+    title: new URL(url).host,
+    frame: { x: 200, y: 200, width: windowFeatures.width ?? 500, height: windowFeatures.height ?? 600 },
+    html: "<!doctype html><body></body>",
+  });
+  const popup = new BrowserView({
+    windowId: popupWindow.id,
+    popupRequestId: requestId,
+    sandbox: true,
+    renderer: "native",
+  });
+  popup.on("close-requested", () => popupWindow.close());
+});
+```
+
+Decline a popup with `respondToNativeRequest(requestId, { accept: false })`.
+The popup shares the opener's partition. A popup from a sandboxed opener can
+only be adopted by a sandboxed view; any other view is created empty instead.
+An adopted popup starts with native requests off, like any new view.
+
+<Aside type="caution">
+Native page requests are available for macOS native WKWebView.
+`setNativeRequestHandling()` returns `false` for CEF and for WebView2 and
+WebKitGTK, and those renderers keep their default behavior.
+`beforeunload` prompts are not included: WKWebView has no public API for them.
+</Aside>
 
 ## Typed RPC
 
@@ -413,6 +516,8 @@ transport; repeated calls are safe.
 
 - Content: `loadURL`, `loadHTML`, `executeJavascript`, `setNavigationRules`,
   `setSpellCheck`.
+- Native page requests: `setNativeRequestHandling`, `respondToNativeRequest`,
+  `cancelDownload`.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
   `findInPage`, `stopFindInPage`.
 - Display: `setPageZoom`, `getPageZoom`.

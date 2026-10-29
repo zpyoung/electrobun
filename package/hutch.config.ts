@@ -54,7 +54,7 @@ export default {
 			"hutch scripts/test-windows-ui-native.js --require-native-wrapper",
 		"test:installer-ui":
 			"node scripts/run-bun-test.js src/shared/windows-installer-progress.test.ts",
-		"test:unit": "node scripts/run-bun-test.js src/shared src/sdks/main src/config src/preload && hutch test:spell-check && hutch test:dialog-paths-native && hutch test:linux-dpi-native && hutch test:linux-x11-geometry-native && hutch test:wayland-screen-capture-frame-native && hutch test:views-url-native && hutch test:webview2-permissions && hutch test:windows-ui-native",
+		"test:unit": "node scripts/run-bun-test.js src/shared src/sdks/main src/config src/preload && hutch test:spell-check && hutch test:native-requests && hutch test:dialog-paths-native && hutch test:linux-dpi-native && hutch test:linux-x11-geometry-native && hutch test:wayland-screen-capture-frame-native && hutch test:views-url-native && hutch test:webview2-permissions && hutch test:windows-ui-native",
 		"test:native-symbol-contract":
 			"node scripts/run-bun-test.js src/shared/native-symbol-contract.test.ts",
 		"test:devkit-manifest":
@@ -88,6 +88,8 @@ export default {
 		"test:release-notes": "node scripts/release-notes-contract.test.mjs",
 		"test:spell-check": "node --test src/shared/spell-check.test.js",
 		"test:macos-spell-check": "scripts/test-macos-spell-check.sh",
+		"test:native-requests": "node --test src/shared/native-requests.test.js",
+		"test:macos-native-requests": "scripts/test-macos-native-requests.sh",
 		"bump-cef": "hutch scripts/update-cef-version.ts",
 	},
 };

@@ -74,8 +74,41 @@ export type BrowserViewOptions<T = undefined> = {
 	// Enables macOS system spell checking for native WKWebView content.
 	// Unsupported renderers/platforms leave their behavior unchanged.
 	spellCheck: boolean;
+	// Adopts the popup announced by a "popup-request" event instead of
+	// creating an empty page. A sandboxed opener's popup needs sandbox: true.
+	popupRequestId: number;
 	// renderer:
 };
+
+export type NativeRequestKind =
+	| "dialogs"
+	| "auth"
+	| "certificates"
+	| "downloads"
+	| "popups"
+	| "externalApps";
+
+export type NativeRequestResponse = {
+	accept: boolean;
+	// prompt() result
+	text?: string;
+	// auth-request credentials
+	username?: string;
+	password?: string;
+	// download-request destination, an absolute path
+	path?: string;
+};
+
+const NATIVE_REQUEST_KIND_BITS: Record<NativeRequestKind, number> = {
+	dialogs: 1 << 0,
+	auth: 1 << 1,
+	certificates: 1 << 2,
+	downloads: 1 << 3,
+	popups: 1 << 4,
+	externalApps: 1 << 5,
+};
+
+const DEFAULT_NATIVE_REQUEST_TIMEOUT_MS = 120_000;
 
 export type BrowserViewCreatedHandler = (view: BrowserView) => void;
 
@@ -138,6 +171,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	startTransparent: boolean = false;
 	startPassthrough: boolean = false;
 	spellCheck: boolean = false;
+	popupRequestId?: number;
 	isRemoved: boolean = false;
 
 	get ptr(): Pointer | null {
@@ -176,6 +210,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.startTransparent = options.startTransparent ?? false;
 		this.startPassthrough = options.startPassthrough ?? false;
 		this.spellCheck = options.spellCheck ?? false;
+		this.popupRequestId = options.popupRequestId;
 
 		this.id = this.init() as number;
 		BrowserViewMap[this.id] = this;
@@ -215,6 +250,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			startTransparent: this.startTransparent,
 			startPassthrough: this.startPassthrough,
 			spellCheck: this.spellCheck,
+			popupRequestId: this.popupRequestId,
 			// transparent is looked up from parent window in native.ts
 		});
 	}
@@ -306,6 +342,57 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		return ffi.request.webviewSetSpellCheck({ id: this.id, enabled });
 	}
 
+	/**
+	 * Lets the app answer page requests that WebKit otherwise resolves on its
+	 * own: JavaScript dialogs, HTTP auth and untrusted-certificate challenges,
+	 * download destinations, popups and external-app launches. Each request
+	 * arrives as an event with a `requestId`; answer it with
+	 * `respondToNativeRequest()`. A request left unanswered for `timeoutMs`
+	 * (default 120 seconds) fails closed and emits "native-request-expired".
+	 * Kinds left out keep the default behavior. Returns false when the
+	 * renderer or platform does not support native requests, in which case
+	 * nothing changes.
+	 */
+	setNativeRequestHandling(
+		kinds: NativeRequestKind[],
+		options?: { timeoutMs?: number },
+	): boolean {
+		const bits = kinds.reduce(
+			(mask, kind) => mask | NATIVE_REQUEST_KIND_BITS[kind],
+			0,
+		);
+		return ffi.request.webviewSetNativeRequestHandling({
+			id: this.id,
+			kinds: bits,
+			timeoutMs: options?.timeoutMs ?? DEFAULT_NATIVE_REQUEST_TIMEOUT_MS,
+		});
+	}
+
+	/**
+	 * Answers a pending native request. Returns false when the request is
+	 * unknown, already answered, expired, or belongs to another view. A popup
+	 * is accepted by creating a BrowserView with its `popupRequestId`;
+	 * responding here can only decline it.
+	 */
+	respondToNativeRequest(
+		requestId: number,
+		response: NativeRequestResponse,
+	): boolean {
+		return ffi.request.webviewRespondToNativeRequest({
+			id: this.id,
+			requestId,
+			responseJson: JSON.stringify(response),
+		});
+	}
+
+	/**
+	 * Cancels an in-progress download by the `id` reported in download
+	 * events. Returns false when no such download is active in this view.
+	 */
+	cancelDownload(downloadId: number): boolean {
+		return ffi.request.webviewCancelDownload({ id: this.id, downloadId });
+	}
+
 	findInPage(
 		searchText: string,
 		options?: { forward?: boolean; matchCase?: boolean },
@@ -366,7 +453,15 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			| "download-started"
 			| "download-progress"
 			| "download-completed"
-			| "download-failed",
+			| "download-failed"
+			| "dialog-request"
+			| "auth-request"
+			| "certificate-request"
+			| "download-request"
+			| "popup-request"
+			| "external-app-request"
+			| "native-request-expired"
+			| "close-requested",
 		handler: (event: unknown) => void,
 	) {
 		const specificName = `${name}-${this.id}`;

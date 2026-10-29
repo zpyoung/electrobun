@@ -736,10 +736,45 @@ std::string GetScriptExecutionUrl(const std::string &frameUrl) {
   return frameUrl;
 }
 
+NSUUID *UUIDFromString(NSString *string) {
+  unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+  CC_SHA256(string.UTF8String, (CC_LONG)string.length, hash);
+  uuid_t uuid;
+  memcpy(uuid, hash, sizeof(uuid));
+  return [[NSUUID alloc] initWithUUIDBytes:uuid];
+}
+
+// the per-view-proxy test compiles this region on its own, without
+// website_data_store.h, so it keeps the name-hash lookup there.
 static WKWebsiteDataStore *
 dataStoreForPartitionIdentifier(NSString *identifier) {
+#if __has_include("website_data_store.h")
   return electrobun::PartitionDataStores::shared().dataStoreForPartition(
       identifier);
+#else
+  if ([identifier hasPrefix:@"persist:"]) {
+    // persistent
+    identifier = [identifier substringFromIndex:8];
+    NSUUID *uuid = UUIDFromString(identifier);
+    if (uuid) {
+      // dataStoreForIdentifier is only available on macOS 14.0+
+      if (@available(macOS 14.0, *)) {
+        return [WKWebsiteDataStore dataStoreForIdentifier:uuid];
+      } else {
+        // Fallback to default data store on older macOS versions
+        NSLog(@"[Session] Partition-specific data stores require macOS 14.0+, "
+              @"using default store");
+        return [WKWebsiteDataStore defaultDataStore];
+      }
+    } else {
+      NSLog(@"Invalid UUID for identifier: %@", identifier);
+      return [WKWebsiteDataStore defaultDataStore];
+    }
+  } else {
+    // ephemeral
+    return [WKWebsiteDataStore nonPersistentDataStore];
+  }
+#endif
 }
 
 static bool runOnMainThreadSyncBool(bool (^block)(void));

@@ -229,6 +229,12 @@ void zoom;
 void spellCheckChanged;
 ```
 
+`reloadIgnoringCache()` reloads the current page without using cached
+responses and returns `false`, without reloading, when the renderer can't do
+that. `supportsReloadIgnoringCache()` and `supportsLoadFailed()` report support
+up front. Native WKWebView on macOS supports both; other renderers report
+`false`.
+
 `executeJavascript()` does not return the evaluated value. Use typed RPC when
 the browser must return data to the main process.
 
@@ -371,7 +377,12 @@ stopWatchingCreatedViews();
 Supported instance event names are `will-navigate`, `did-navigate`,
 `did-navigate-in-page`, `did-commit-navigation`, `dom-ready`,
 `download-started`, `download-progress`, `download-completed`,
-`download-failed`, and `drop-source-paths`.
+`download-failed`, `drop-source-paths`, and `load-failed`.
+
+`load-failed` carries `{ url, domain, code, description }` for a navigation
+that failed before or after it committed. Depending on the WebKit version, a
+navigation that is stopped or replaced by a newer one may report
+`NSURLErrorDomain` code `-999`.
 
 ### Dropped file paths
 
@@ -485,7 +496,8 @@ transport; repeated calls are safe.
 ## Public methods
 
 - Content: `loadURL`, `loadHTML`, `executeJavascript`, `setNavigationRules`,
-  `setSpellCheck`, `supportsDropSourcePaths`.
+  `setSpellCheck`, `supportsDropSourcePaths`, `reloadIgnoringCache`,
+  `supportsReloadIgnoringCache`, `supportsLoadFailed`.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
   `findInPage`, `stopFindInPage`.
 - Display: `setPageZoom`, `getPageZoom`.
@@ -520,6 +532,9 @@ request/response envelope themselves; the `.on()` event emitter — native
 webview events arrive through the C callbacks fixed at creation
 (`decide_navigation`, `event`, and the bridge handlers); JavaScript
 evaluation with a returned result — only the fire-and-forget
-`evaluateJavaScriptWithNoCompletion` exists; and the download event stream
+`evaluateJavaScriptWithNoCompletion` exists; `reloadIgnoringCache` and its
+support checks, which are C exports of the core library
+(`webviewReloadIgnoringCache`, `webviewSupportsReloadIgnoringCache`,
+`webviewSupportsLoadFailed`) without SDK wrappers; and the download event stream
 (`download-started` through `download-failed`), which has no native
 equivalent.

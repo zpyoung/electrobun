@@ -7,7 +7,7 @@ export type WebviewEventBridgeMessage = {
 };
 
 // Reported by the native wrapper only, so a page can't forge them.
-const NATIVE_ONLY_EVENT_NAMES = new Set(["drop-source-paths"]);
+const NATIVE_ONLY_EVENT_NAMES = new Set(["drop-source-paths", "load-failed"]);
 
 function isJsonRecord(value: unknown): value is JsonRecord {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

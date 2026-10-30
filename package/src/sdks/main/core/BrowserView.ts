@@ -314,6 +314,25 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		return ffi.request.webviewSupportsDropSourcePaths({ id: this.id });
 	}
 
+	/**
+	 * Reloads the current page, revalidating every resource with its server
+	 * instead of using cached responses. Returns false, without reloading, when
+	 * the current renderer/platform does not support it.
+	 */
+	reloadIgnoringCache(): boolean {
+		return ffi.request.webviewReloadIgnoringCache({ id: this.id });
+	}
+
+	/** Whether `reloadIgnoringCache()` is supported by the current renderer/platform. */
+	supportsReloadIgnoringCache(): boolean {
+		return ffi.request.webviewSupportsReloadIgnoringCache({ id: this.id });
+	}
+
+	/** Whether the current renderer/platform emits `load-failed` events. */
+	supportsLoadFailed(): boolean {
+		return ffi.request.webviewSupportsLoadFailed({ id: this.id });
+	}
+
 	findInPage(
 		searchText: string,
 		options?: { forward?: boolean; matchCase?: boolean },
@@ -376,6 +395,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			| "download-completed"
 			| "download-failed"
 			| "drop-source-paths",
+			| "load-failed",
 		handler: (event: unknown) => void,
 	) {
 		const specificName = `${name}-${this.id}`;

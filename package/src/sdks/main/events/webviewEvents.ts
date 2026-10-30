@@ -1,6 +1,14 @@
 import ElectrobunEvent from "./event";
 
 type DetailData = { detail: string };
+type LoadFailedData = {
+	detail: {
+		url: string;
+		domain: string;
+		code: number;
+		description: string;
+	};
+};
 type NewWindowOpenData = {
 	detail:
 		| string
@@ -40,4 +48,6 @@ export default {
 		new ElectrobunEvent<DetailData, {}>("download-failed", data),
 	dropSourcePaths: (data: DropSourcePathsData) =>
 		new ElectrobunEvent<DropSourcePathsData, {}>("drop-source-paths", data),
+	loadFailed: (data: LoadFailedData) =>
+		new ElectrobunEvent<LoadFailedData, {}>("load-failed", data),
 };

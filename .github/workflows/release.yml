@@ -181,6 +181,15 @@ jobs:
         run: hutch test:macos-isolated-preview
         working-directory: package
 
+      - name: Test user-agent contract
+        run: hutch test:user-agent
+        working-directory: package
+
+      - name: Exercise macOS WKWebView user agents
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-user-agent
+        working-directory: package
+
       - name: Setup MSVC Developer Command Prompt
         if: matrix.platform == 'win32'
         uses: ilammy/msvc-dev-cmd@v1

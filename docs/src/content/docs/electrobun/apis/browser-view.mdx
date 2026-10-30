@@ -185,6 +185,7 @@ The constructor accepts `Partial<BrowserViewOptions>`.
 | `spellCheck` | `boolean` | `false` | Enable native spell checking where supported. |
 | `popupRequestId` | `number` | none | Adopt the popup from a `popup-request` event. See [Native page requests](#native-page-requests). |
 | `isolatedPreview` | `{ scheme: string; handler?: IsolatedPreviewHandler } \| null` | `null` | Create an [isolated preview](#isolated-preview-views) served only by `scheme`. |
+| `userAgent` | `string \| null` | `null` | Custom User-Agent, sent from the first request on. See [User agent](#user-agent). |
 
 <Aside type="note">
 Use the DOM `<electrobun-webview>` element when the view's bounds should follow
@@ -415,6 +416,39 @@ listener. A preview refuses `loadHTML()`.
 Isolated previews are supported only by the native renderer on macOS.
 `BrowserView.isIsolatedPreviewSupported()` returns `false` on Linux and
 Windows, and creating one there, or with `renderer: "cef"`, throws.
+
+## User agent
+
+A view can send its own User-Agent instead of the engine's. Set it at creation
+with the `userAgent` option, so even the first request carries it, or change it
+later with `setUserAgent()`. A change applies from the view's next request on;
+reload or navigate to send it for the current page. Pass `null` to go back to
+the engine default. The same string is what pages read from
+`navigator.userAgent`.
+
+`BrowserView.getDefaultUserAgent()` returns the user agent the native renderer
+uses when no custom one is set, so an app can derive its own from it.
+
+```ts
+import { BrowserView } from "electrobun/main";
+
+const engineUserAgent = BrowserView.getDefaultUserAgent();
+
+const view = new BrowserView({
+  url: "https://example.com",
+  userAgent: engineUserAgent ? `${engineUserAgent} MyApp/1.0` : null,
+});
+
+if (!view.setUserAgent(null)) {
+  // This renderer/platform can't change the user agent.
+}
+```
+
+Only the macOS native renderer (WKWebView) supports custom user agents. On
+CEF, Linux and Windows, `setUserAgent()` returns `false` and changes nothing,
+the `userAgent` option logs a warning and keeps the engine default, and
+`getDefaultUserAgent()` returns `null`. `view.userAgent` always holds the
+custom user agent in effect, or `null`.
 
 ## Host message queue diagnostics
 
@@ -720,7 +754,8 @@ transport; repeated calls are safe.
 
 - Content: `loadURL`, `loadHTML`, `executeJavascript`, `setNavigationRules`,
   `setSpellCheck`, `supportsDropSourcePaths`, `reloadIgnoringCache`,
-  `supportsReloadIgnoringCache`, `supportsLoadFailed`, `setIsolatedPreviewHandler`.
+  `supportsReloadIgnoringCache`, `supportsLoadFailed`, `setIsolatedPreviewHandler`,
+  `setUserAgent`.
 - Native page requests: `setNativeRequestHandling`, `respondToNativeRequest`,
   `cancelDownload`.
 - Developer tools and find: `openDevTools`, `closeDevTools`, `toggleDevTools`,
@@ -730,6 +765,7 @@ transport; repeated calls are safe.
 - Lifecycle and events: `on`, `remove`, `ptr`.
 - Static ownership: `getById`, `getAll`, `ensureWrapped`, `adoptExisting`, `on`,
   `off`, `isIsolatedPreviewSupported` and `defineRPC`.
+- Static engine info: `getDefaultUserAgent`.
 
 ## Native SDKs
 

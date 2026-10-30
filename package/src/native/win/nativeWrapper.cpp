@@ -11251,6 +11251,18 @@ ELECTROBUN_EXPORT bool webviewCancelDownload(AbstractView* abstractView, uint32_
     return false;
 }
 
+ELECTROBUN_EXPORT bool webviewSetUserAgent(AbstractView* abstractView, const char* userAgent) {
+    (void)abstractView;
+    (void)userAgent;
+    // Per-view user agents are implemented for macOS WKWebView only, not WebView2 or CEF.
+    return false;
+}
+
+ELECTROBUN_EXPORT const char* getDefaultUserAgent() {
+    // NULL tells callers the default user agent can't be read on this platform.
+    return nullptr;
+}
+
 ELECTROBUN_EXPORT void setWebviewNavigationRules(AbstractView *abstractView, const char *rulesJson) {
     if (abstractView) {
         // UI operations must be performed on the main thread

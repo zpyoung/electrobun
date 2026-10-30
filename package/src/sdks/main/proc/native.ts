@@ -484,6 +484,14 @@ const core = (() => {
 				args: [FFIType.u32],
 				returns: FFIType.void,
 			},
+			webviewSetUserAgent: {
+				args: [FFIType.u32, FFIType.cstring],
+				returns: FFIType.bool,
+			},
+			getDefaultUserAgent: {
+				args: [],
+				returns: FFIType.cstring,
+			},
 			setWebviewNavigationRules: {
 				args: [FFIType.u32, FFIType.cstring],
 				returns: FFIType.void,
@@ -2251,6 +2259,14 @@ const _ffiImpl = {
 				params.id,
 				params.downloadId,
 			);
+		},
+		webviewSetUserAgent: (params: { id: number; userAgent: string }) => {
+			return core_.symbols.webviewSetUserAgent(params.id, toCString(params.userAgent));
+		},
+		getDefaultUserAgent: (): string | null => {
+			const result = core_.symbols.getDefaultUserAgent();
+			if (!result) return null;
+			return result.toString();
 		},
 		setWebviewNavigationRules: (params: { id: number; rulesJson: string }) => {
 			core_.symbols.setWebviewNavigationRules(params.id, toCString(params.rulesJson));

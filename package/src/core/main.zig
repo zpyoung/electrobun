@@ -3348,6 +3348,16 @@ export fn setNextWebviewAllowedProtocols(allow_views: bool, allow_app_data: bool
     set_allowed_protocols(allow_views, allow_app_data);
 }
 
+export fn setNextWebviewPopupRequest(request_id: u32) void {
+    clearLastError();
+    const SetNextWebviewPopupRequestFn = *const fn (u32) callconv(.c) void;
+    const set_popup_request = lookupNativeSymbol(
+        SetNextWebviewPopupRequestFn,
+        "setNextWebviewPopupRequest",
+    ) orelse return;
+    set_popup_request(request_id);
+}
+
 export fn getWebviewPointer(webview_id: u32) WebviewPtr {
     clearLastError();
     return lookupWebviewPtr(webview_id);
@@ -3552,6 +3562,40 @@ export fn webviewSupportsDropSourcePaths(webview_id: u32) bool {
         "webviewSupportsDropSourcePaths",
     ) orelse return false;
     return webview_supports_drop_source_paths(webview);
+}
+
+export fn webviewSetNativeRequestHandling(webview_id: u32, kinds: u32, timeout_ms: f64) bool {
+    clearLastError();
+    const WebviewSetNativeRequestHandlingFn = *const fn (WebviewPtr, u32, f64) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const set_native_request_handling = lookupNativeSymbol(
+        WebviewSetNativeRequestHandlingFn,
+        "webviewSetNativeRequestHandling",
+    ) orelse return false;
+    return set_native_request_handling(webview, kinds, timeout_ms);
+}
+
+export fn webviewRespondToNativeRequest(
+    webview_id: u32,
+    request_id: u32,
+    response_json: [*:0]const u8,
+) bool {
+    clearLastError();
+    const WebviewRespondToNativeRequestFn = *const fn (WebviewPtr, u32, [*:0]const u8) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const respond_to_native_request = lookupNativeSymbol(
+        WebviewRespondToNativeRequestFn,
+        "webviewRespondToNativeRequest",
+    ) orelse return false;
+    return respond_to_native_request(webview, request_id, response_json);
+}
+
+export fn webviewCancelDownload(webview_id: u32, download_id: u32) bool {
+    clearLastError();
+    const WebviewCancelDownloadFn = *const fn (WebviewPtr, u32) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const cancel_download = lookupNativeSymbol(WebviewCancelDownloadFn, "webviewCancelDownload") orelse return false;
+    return cancel_download(webview, download_id);
 }
 
 export fn setWebviewNavigationRules(webview_id: u32, rules_json: [*:0]const u8) void {

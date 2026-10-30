@@ -4,7 +4,18 @@ import {
 	BrowserView,
 	type BrowserViewCreatedHandler,
 	type BrowserViewOptions,
+	type NativeRequestKind,
+	type NativeRequestResponse,
 } from "./core/BrowserView";
+import type {
+	AuthRequest,
+	CertificateRequest,
+	DialogRequest,
+	DownloadRequest,
+	ExternalAppRequest,
+	NativeRequestExpired,
+	PopupRequest,
+} from "./events/webviewEvents";
 import { GpuWindow, type GpuWindowOptionsType } from "./core/GpuWindow";
 import { WGPUView, type WGPUViewOptions } from "./core/WGPUView";
 import { Tray, type TrayOptions } from "./core/Tray";
@@ -231,6 +242,15 @@ export {
 	type WindowOptionsType,
 	type BrowserViewOptions,
 	type BrowserViewCreatedHandler,
+	type NativeRequestKind,
+	type NativeRequestResponse,
+	type DialogRequest,
+	type AuthRequest,
+	type CertificateRequest,
+	type DownloadRequest,
+	type PopupRequest,
+	type ExternalAppRequest,
+	type NativeRequestExpired,
 	type GpuWindowOptionsType,
 	type WGPUViewOptions,
 	type TrayOptions,

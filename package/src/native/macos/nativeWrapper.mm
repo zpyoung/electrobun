@@ -33,6 +33,7 @@ static bool wgpuDebugEnabled() {
 #include "load_failed.h"
 #include "native_requests.h"
 #include "spell_check.h"
+#include "website_data_store.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
 #include <mutex>
@@ -743,8 +744,14 @@ NSUUID *UUIDFromString(NSString *string) {
   return [[NSUUID alloc] initWithUUIDBytes:uuid];
 }
 
+// the per-view-proxy test compiles this region on its own, without
+// website_data_store.h, so it keeps the name-hash lookup there.
 static WKWebsiteDataStore *
 dataStoreForPartitionIdentifier(NSString *identifier) {
+#if __has_include("website_data_store.h")
+  return electrobun::PartitionDataStores::shared().dataStoreForPartition(
+      identifier);
+#else
   if ([identifier hasPrefix:@"persist:"]) {
     // persistent
     identifier = [identifier substringFromIndex:8];
@@ -767,6 +774,7 @@ dataStoreForPartitionIdentifier(NSString *identifier) {
     // ephemeral
     return [WKWebsiteDataStore nonPersistentDataStore];
   }
+#endif
 }
 
 static bool runOnMainThreadSyncBool(bool (^block)(void));
@@ -3526,6 +3534,12 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
     NSString *viewsRootString = (viewsRoot && strlen(viewsRoot) > 0)
                                     ? [NSString stringWithUTF8String:viewsRoot]
                                     : nil;
+    // the caller frees partitionIdentifier once this returns, so the async
+    // block below must not read it.
+    NSString *partitionString =
+        [NSString stringWithUTF8String:partitionIdentifier];
+    electrobun::PartitionDataStores::shared().noteWebviewCreated(
+        partitionString);
 
     // TODO: rewrite this so we can return a reference to the AbstractRenderer
     // and then call init from zig after the handle is added to the webviewMap
@@ -3539,7 +3553,7 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
           [[WKWebViewConfiguration alloc] init];
 
       configuration.websiteDataStore =
-          createDataStoreForPartition(partitionIdentifier);
+          createDataStoreForPartition([partitionString UTF8String]);
 
       [configuration.preferences setValue:@YES
                                    forKey:@"developerExtrasEnabled"];
@@ -11680,68 +11694,62 @@ extern "C" void sessionClearCookies(const char *partitionIdentifier) {
       });
 }
 
-// Clear all storage data for a partition (WKWebView)
-// storageTypesJson: ["cookies", "localStorage", "sessionStorage", "indexedDB",
-// "cache"] or null for all
-extern "C" void sessionClearStorageData(const char *partitionIdentifier,
-                                        const char *storageTypesJson) {
+// Clear storage data for a partition (WKWebView)
+// storageTypesJson: ["all"] or any of ["cookies", "localStorage",
+// "sessionStorage", "indexedDB", "cache", "serviceWorkers"]
+// Returns an electrobun::StorageClearStatus.
+extern "C" int32_t sessionClearStorageData(const char *partitionIdentifier,
+                                           const char *storageTypesJson) {
   NSString *partitionStr =
       partitionIdentifier ? [NSString stringWithUTF8String:partitionIdentifier]
                           : @"";
   NSString *typesStr =
       storageTypesJson ? [NSString stringWithUTF8String:storageTypesJson] : @"";
 
-  waitForMainThreadAsyncCompletion(
+  __block int32_t status = electrobun::StorageClearTimedOut;
+  bool completed = waitForMainThreadAsyncCompletion(
       10 * NSEC_PER_SEC, ^(dispatch_semaphore_t completionSemaphore) {
         @autoreleasepool {
-          WKWebsiteDataStore *dataStore =
-              createDataStoreForPartition([partitionStr UTF8String]);
-
-          NSMutableSet *dataTypes = [NSMutableSet set];
-
-          if (typesStr.length > 0) {
-            NSData *jsonData =
-                [typesStr dataUsingEncoding:NSUTF8StringEncoding];
-            NSArray *types = [NSJSONSerialization JSONObjectWithData:jsonData
-                                                             options:0
-                                                               error:nil];
-
-            for (NSString *type in types) {
-              if ([type isEqualToString:@"cookies"]) {
-                [dataTypes addObject:WKWebsiteDataTypeCookies];
-              } else if ([type isEqualToString:@"localStorage"]) {
-                [dataTypes addObject:WKWebsiteDataTypeLocalStorage];
-              } else if ([type isEqualToString:@"sessionStorage"]) {
-                [dataTypes addObject:WKWebsiteDataTypeSessionStorage];
-              } else if ([type isEqualToString:@"indexedDB"]) {
-                [dataTypes addObject:WKWebsiteDataTypeIndexedDBDatabases];
-              } else if ([type isEqualToString:@"cache"]) {
-                [dataTypes addObject:WKWebsiteDataTypeDiskCache];
-                [dataTypes addObject:WKWebsiteDataTypeMemoryCache];
-              } else if ([type isEqualToString:@"serviceWorkers"]) {
-                [dataTypes
-                    addObject:WKWebsiteDataTypeServiceWorkerRegistrations];
-              }
-            }
-          } else {
-            dataTypes = [NSMutableSet
-                setWithSet:[WKWebsiteDataStore allWebsiteDataTypes]];
-          }
-
-          if (dataTypes.count == 0) {
-            dispatch_semaphore_signal(completionSemaphore);
-            return;
-          }
-
-          NSDate *dateFrom = [NSDate dateWithTimeIntervalSince1970:0];
-
-          [dataStore removeDataOfTypes:dataTypes
-                         modifiedSince:dateFrom
-                     completionHandler:^{
-                       dispatch_semaphore_signal(completionSemaphore);
-                     }];
+          electrobun::clearPartitionWebsiteData(
+              partitionStr, typesStr,
+              ^(electrobun::StorageClearStatus clearStatus) {
+                status = clearStatus;
+                dispatch_semaphore_signal(completionSemaphore);
+              });
         }
       });
+  return completed ? status : electrobun::StorageClearTimedOut;
+}
+
+// Assign the WKWebsiteDataStore identifier a persist: partition uses. Must be
+// called before the first webview for the partition is created.
+// Returns an electrobun::StorageIdentifierStatus.
+extern "C" int32_t sessionSetStorageIdentifier(const char *partitionIdentifier,
+                                               const char *identifier) {
+  NSString *partitionStr =
+      partitionIdentifier ? [NSString stringWithUTF8String:partitionIdentifier]
+                          : @"";
+  NSString *identifierStr =
+      identifier ? [NSString stringWithUTF8String:identifier] : nil;
+  return electrobun::PartitionDataStores::shared().assignIdentifier(
+      partitionStr, identifierStr);
+}
+
+// The identifier of the data store a native webview was created with, or
+// NULL for CEF views, non-persistent partitions and macOS before 14.
+extern "C" const char *webviewGetStorageIdentifier(AbstractView *abstractView) {
+  __block char *result = NULL;
+  runOnMainThreadSyncVoid(^{
+    if ([abstractView isKindOfClass:[WKWebViewImpl class]]) {
+      WKWebViewImpl *wkImpl = (WKWebViewImpl *)abstractView;
+      NSString *identifier = electrobun::dataStoreIdentifierString(
+          wkImpl.webView.configuration.websiteDataStore);
+      if (identifier) {
+        result = strdup([identifier UTF8String]);
+      }
+    }
+  });
+  return result;
 }
 
 // Window icon - Linux only, no-op for macOS (macOS uses app bundle icon)

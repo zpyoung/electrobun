@@ -139,6 +139,7 @@ using electrobun::OperationGuard;
 #include "include/cef_dialog_handler.h"
 #include "../shared/permissions_cef.h"
 #include "../shared/partition_context.h"
+#include "../shared/storage_status.h"
 #include "include/cef_download_handler.h"
 #include "include/wrapper/cef_helpers.h"
 
@@ -13032,8 +13033,9 @@ ELECTROBUN_EXPORT void sessionClearCookies(const char* partitionIdentifier) {
     return;
 }
 
-// Clear storage data (WebKit2GTK)
-ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionIdentifier, const char* storageTypesJson) {
+// Clear storage data (WebKit2GTK). Completion isn't reported here yet, so
+// callers must not treat the data as removed.
+ELECTROBUN_EXPORT int32_t sessionClearStorageData(const char* partitionIdentifier, const char* storageTypesJson) {
     // Copy arguments before dispatching to main thread
     std::string partitionStr = partitionIdentifier ? partitionIdentifier : "";
     std::string typesStr = storageTypesJson ? storageTypesJson : "";
@@ -13099,6 +13101,18 @@ ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionIdentifier, 
         g_source_unref(timeout);
         g_main_loop_unref(loop);
     });
+    return electrobun::StorageClearUnsupportedPlatform;
+}
+
+ELECTROBUN_EXPORT int32_t sessionSetStorageIdentifier(const char* partitionIdentifier, const char* identifier) {
+    (void)partitionIdentifier;
+    (void)identifier;
+    return electrobun::StorageIdentifierUnsupportedPlatform;
+}
+
+ELECTROBUN_EXPORT const char* webviewGetStorageIdentifier(AbstractView* abstractView) {
+    (void)abstractView;
+    return nullptr;
 }
 
 // Session proxies are not implemented for WebKitGTK or CEF on Linux yet.

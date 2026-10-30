@@ -384,6 +384,7 @@ extern "C" __declspec(dllexport) void asar_close(void* archive) {
 #include "include/cef_dialog_handler.h"
 #include "../shared/permissions_cef.h"
 #include "../shared/partition_context.h"
+#include "../shared/storage_status.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_task.h"
 #include "include/views/cef_display.h"
@@ -14624,8 +14625,9 @@ extern "C" ELECTROBUN_EXPORT void sessionClearCookies(const char* partitionIdent
     cookieManager->DeleteAllCookies();
 }
 
-// Clear storage data (WebView2) - uses Profile API
-extern "C" ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionIdentifier, const char* storageTypesJson) {
+// Clear storage data (WebView2) - uses Profile API. Completion isn't reported
+// here yet, so callers must not treat the data as removed.
+extern "C" ELECTROBUN_EXPORT int32_t sessionClearStorageData(const char* partitionIdentifier, const char* storageTypesJson) {
     // Find a WebView2 instance
     WebView2View* view = nullptr;
     for (auto& pair : g_webview2Views) {
@@ -14636,7 +14638,7 @@ extern "C" ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionI
     }
 
     if (!view || !view->getWebView()) {
-        return;
+        return electrobun::StorageClearUnsupportedPlatform;
     }
 
     // Try to get Profile interface for clearing browsing data
@@ -14678,6 +14680,18 @@ extern "C" ELECTROBUN_EXPORT void sessionClearStorageData(const char* partitionI
             }
         }
     }
+    return electrobun::StorageClearUnsupportedPlatform;
+}
+
+extern "C" ELECTROBUN_EXPORT int32_t sessionSetStorageIdentifier(const char* partitionIdentifier, const char* identifier) {
+    (void)partitionIdentifier;
+    (void)identifier;
+    return electrobun::StorageIdentifierUnsupportedPlatform;
+}
+
+extern "C" ELECTROBUN_EXPORT const char* webviewGetStorageIdentifier(AbstractView* abstractView) {
+    (void)abstractView;
+    return nullptr;
 }
 
 // Session proxies are not implemented for WebView2 or CEF on Windows yet.

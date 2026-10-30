@@ -13,5 +13,7 @@ export type {
 	Point,
 	Rectangle,
 	SessionProxy,
+	StorageClearResult,
+	StorageIdentifierResult,
 	StorageType,
 } from "../proc/native";

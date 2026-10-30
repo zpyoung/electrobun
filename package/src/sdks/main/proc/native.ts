@@ -426,6 +426,10 @@ const core = (() => {
 				args: [FFIType.u32, FFIType.bool],
 				returns: FFIType.bool,
 			},
+			webviewSupportsDropSourcePaths: {
+				args: [FFIType.u32],
+				returns: FFIType.bool,
+			},
 			setWebviewNavigationRules: {
 				args: [FFIType.u32, FFIType.cstring],
 				returns: FFIType.void,
@@ -2095,6 +2099,9 @@ const _ffiImpl = {
 		webviewSetSpellCheck: (params: { id: number; enabled: boolean }) => {
 			return core_.symbols.webviewSetSpellCheck(params.id, params.enabled);
 		},
+		webviewSupportsDropSourcePaths: (params: { id: number }) => {
+			return core_.symbols.webviewSupportsDropSourcePaths(params.id);
+		},
 		setWebviewNavigationRules: (params: { id: number; rulesJson: string }) => {
 			core_.symbols.setWebviewNavigationRules(params.id, toCString(params.rulesJson));
 		},
@@ -3429,6 +3436,7 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		"download-progress": "downloadProgress",
 		"download-completed": "downloadCompleted",
 		"download-failed": "downloadFailed",
+		"drop-source-paths": "dropSourcePaths",
 		"load-started": "loadStarted",
 		"load-committed": "loadCommitted",
 		"load-finished": "loadFinished",
@@ -3460,7 +3468,8 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		eventName === "download-started" ||
 		eventName === "download-progress" ||
 		eventName === "download-completed" ||
-		eventName === "download-failed"
+		eventName === "download-failed" ||
+		eventName === "drop-source-paths"
 	) {
 		try {
 			parsedDetail = JSON.parse(detail);

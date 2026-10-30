@@ -235,10 +235,10 @@ the internal last-window shutdown logic.
 Current webview event names are `will-navigate`, `did-navigate`,
 `did-navigate-in-page`, `did-commit-navigation`, `dom-ready`,
 `new-window-open`, `host-message`, `download-started`, `download-progress`,
-`download-completed`, and `download-failed`.
+`download-completed`, `download-failed`, and `drop-source-paths`.
 
 The `BrowserView.on()` typed surface currently includes navigation, readiness,
-and download events. `<electrobun-webview>` exposes its browser-side event
+download and dropped-file-path events. `<electrobun-webview>` exposes its browser-side event
 surface documented on the [webview tag page](/electrobun/apis/browser/electrobun-webview-tag/).
 
 ## Shutdown

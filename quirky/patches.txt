@@ -1,0 +1,10 @@
+# base v2.0.5
+# One patch per line, merged in this order: <branch> <test command run from the repo root>
+patch/drop-source-paths cd package && node --test src/shared/drop-source-paths.test.js && scripts/test-macos-drop-source-paths.sh && node scripts/run-bun-test.js src/sdks/main/proc/eventBridge.test.ts src/shared/native-symbol-contract.test.ts
+patch/per-view-proxy cd package && node scripts/run-bun-test.js src/sdks/main/__tests__/session-proxy.test.ts src/shared/native-symbol-contract.test.ts
+patch/hard-reload-load-failed cd package && scripts/test-macos-webview-navigation.sh && node scripts/run-bun-test.js src/shared/webview-navigation-contract.test.ts src/shared/native-symbol-contract.test.ts src/sdks/main/proc/eventBridge.test.ts
+patch/webview-native-events node --test package/src/shared/native-requests.test.js && package/scripts/test-macos-native-requests.sh
+patch/storage-clear-completion cd package && node scripts/run-bun-test.js src/sdks/main/__tests__/session-storage.test.ts src/shared/native-symbol-contract.test.ts && scripts/test-macos-website-data-store.sh
+patch/isolated-preview-view cd package && node --test src/shared/isolated-preview.test.js && scripts/test-macos-isolated-preview.sh && node scripts/run-bun-test.js src/shared/native-symbol-contract.test.ts
+patch/webview-user-agent cd package && node --test src/shared/user-agent.test.js && scripts/test-macos-user-agent.sh
+patch/notification-callbacks cd package && node scripts/run-bun-test.js src/shared/notification-callbacks.test.ts src/shared/native-symbol-contract.test.ts && scripts/test-macos-notification-response.sh

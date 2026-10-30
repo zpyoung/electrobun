@@ -1,4 +1,4 @@
-import { ffi, native } from "../proc/native";
+import { ffi, native, type NotificationPermission } from "../proc/native";
 import { electrobunEventEmitter } from "../events/eventEmitter";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, posix, resolve, win32 } from "node:path";
@@ -6,6 +6,8 @@ import { lstatSync, readFileSync } from "node:fs";
 import { OS, type SupportedOS } from "../../../shared/platform";
 import { decodeDialogPaths } from "../../../shared/dialog-paths";
 import { isBuildEnvironment } from "../../../shared/naming";
+
+export type { NotificationPermission };
 
 export const moveToTrash = (path: string) => {
 	return ffi.request.moveToTrash({ path });
@@ -80,6 +82,12 @@ export type NotificationOptions = {
 	 * If true, the notification will not play a sound
 	 */
 	silent?: boolean;
+	/**
+	 * Identifies the notification in `notification-click` and
+	 * `notification-dismiss` events. Showing another notification with the same
+	 * id replaces it on macOS. Defaults to a random UUID.
+	 */
+	id?: string;
 };
 
 /**
@@ -90,6 +98,8 @@ export type NotificationOptions = {
  * @param options.body - The main body text
  * @param options.subtitle - A subtitle (macOS shows this between title and body)
  * @param options.silent - If true, no sound will be played
+ * @param options.id - Identifies the notification in click and dismiss events
+ * @returns The notification's id
  *
  * @example
  * // Simple notification
@@ -116,10 +126,32 @@ export type NotificationOptions = {
  *   silent: true
  * });
  */
-export const showNotification = (options: NotificationOptions): void => {
-	const { title, body, subtitle, silent } = options;
-	ffi.request.showNotification({ title, body, subtitle, silent });
+export const showNotification = (options: NotificationOptions): string => {
+	const { title, body, subtitle, silent, id = crypto.randomUUID() } = options;
+	ffi.request.showNotification({ title, body, subtitle, silent, id });
+	return id;
 };
+
+/**
+ * Read whether the app may show notifications, without asking the user.
+ *
+ * Resolves `"unsupported"` where the platform can't report permission, clicks
+ * or dismissals, which is everywhere except macOS. On those platforms
+ * `notification-click` and `notification-dismiss` never fire.
+ */
+export const getNotificationPermission = (): Promise<NotificationPermission> => {
+	return ffi.request.getNotificationPermission({ prompt: false });
+};
+
+/**
+ * Ask the user to allow notifications if they haven't decided yet, and resolve
+ * with the resulting permission. macOS shows its prompt only once per app;
+ * after that this resolves with the stored decision.
+ */
+export const requestNotificationPermission =
+	(): Promise<NotificationPermission> => {
+		return ffi.request.getNotificationPermission({ prompt: true });
+	};
 
 let isQuitting = false;
 const quitApprovalBrand = Symbol("ElectrobunQuitApproval");

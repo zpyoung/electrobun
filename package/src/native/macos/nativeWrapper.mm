@@ -33,6 +33,7 @@ static bool wgpuDebugEnabled() {
 #include "load_failed.h"
 #include "native_requests.h"
 #include "isolated_preview.h"
+#include "notification_response.h"
 #include "spell_check.h"
 #include "website_data_store.h"
 #include "user_agent.h"
@@ -10526,8 +10527,119 @@ static void showNotificationLegacy(NSString *titleStr, NSString *bodyStr,
   });
 }
 
-extern "C" void showNotification(const char *title, const char *body,
-                                 const char *subtitle, BOOL silent) {
+typedef void (*NotificationResponseHandler)(const char *event,
+                                            const char *notificationId);
+typedef void (*NotificationPermissionHandler)(uint32_t requestId,
+                                              int32_t status);
+
+static NotificationResponseHandler g_notificationResponseHandler = nullptr;
+static NotificationPermissionHandler g_notificationPermissionHandler = nullptr;
+
+// macOS only reports a dismissal for notifications whose category opts in.
+static NSString *const kElectrobunNotificationCategory =
+    @"electrobun.notification";
+
+// Reported when the platform can't answer, so callers never mistake it for a
+// UNAuthorizationStatus value.
+static const int32_t kNotificationPermissionUnavailable = -1;
+
+@interface ElectrobunNotificationDelegate
+    : NSObject <UNUserNotificationCenterDelegate>
+@end
+
+@implementation ElectrobunNotificationDelegate
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+    didReceiveNotificationResponse:(UNNotificationResponse *)response
+             withCompletionHandler:(void (^)(void))completionHandler {
+  const char *event =
+      electrobun::notificationResponseEvent(response.actionIdentifier);
+  NotificationResponseHandler handler = g_notificationResponseHandler;
+  if (event && handler) {
+    // the threadsafe JS callback reads the id later, so it gets its own copy
+    handler(event,
+            strdup(response.notification.request.identifier.UTF8String));
+  }
+  completionHandler();
+}
+@end
+
+// The center delegate is weak, so this keeps it alive.
+static ElectrobunNotificationDelegate *g_notificationDelegate = nil;
+
+extern "C" void
+setNotificationHandlers(NotificationResponseHandler responseHandler,
+                        NotificationPermissionHandler permissionHandler) {
+  g_notificationResponseHandler = responseHandler;
+  g_notificationPermissionHandler = permissionHandler;
+
+  UNUserNotificationCenter *center =
+      electrobun::notificationCenterIfAvailable([NSBundle mainBundle]);
+  if (!center) {
+    return;
+  }
+  if (!g_notificationDelegate) {
+    g_notificationDelegate = [[ElectrobunNotificationDelegate alloc] init];
+  }
+  center.delegate = g_notificationDelegate;
+  UNNotificationCategory *category = [UNNotificationCategory
+      categoryWithIdentifier:kElectrobunNotificationCategory
+                     actions:@[]
+           intentIdentifiers:@[]
+                     options:UNNotificationCategoryOptionCustomDismissAction];
+  [center setNotificationCategories:[NSSet setWithObject:category]];
+}
+
+static void reportNotificationPermission(uint32_t requestId, int32_t status) {
+  NotificationPermissionHandler handler = g_notificationPermissionHandler;
+  if (handler) {
+    handler(requestId, status);
+  }
+}
+
+// Reports the authorization status through the permission handler, asking the
+// user first when prompt is true. Returns immediately; the prompt can wait on
+// the user indefinitely.
+extern "C" void requestNotificationPermission(uint32_t requestId, BOOL prompt) {
+  UNUserNotificationCenter *center =
+      electrobun::notificationCenterIfAvailable([NSBundle mainBundle]);
+  if (!center) {
+    reportNotificationPermission(requestId, kNotificationPermissionUnavailable);
+    return;
+  }
+
+  void (^reportSettings)(void) = ^{
+    [center getNotificationSettingsWithCompletionHandler:^(
+                UNNotificationSettings *settings) {
+      reportNotificationPermission(requestId,
+                                   (int32_t)settings.authorizationStatus);
+    }];
+  };
+  if (!prompt) {
+    reportSettings();
+    return;
+  }
+
+  [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert |
+                                           UNAuthorizationOptionSound |
+                                           UNAuthorizationOptionBadge)
+                        completionHandler:^(BOOL granted,
+                                            NSError *_Nullable error) {
+                          // a refusal leaves showNotification's own first
+                          // request to choose the legacy fallback, as before
+                          if (granted) {
+                            notificationAuthRequested = YES;
+                            notificationAuthGranted = YES;
+                          } else if (error) {
+                            NSLog(@"Notification authorization error: %@",
+                                  error);
+                          }
+                          reportSettings();
+                        }];
+}
+
+extern "C" void showNotificationWithId(const char *title, const char *body,
+                                       const char *subtitle, BOOL silent,
+                                       const char *notificationId) {
   NSString *titleStr = [NSString stringWithUTF8String:title ?: ""];
   NSString *bodyStr = [NSString stringWithUTF8String:body ?: ""];
   NSString *subtitleStr =
@@ -10540,7 +10652,11 @@ extern "C" void showNotification(const char *title, const char *body,
   }
 
   UNUserNotificationCenter *center =
-      [UNUserNotificationCenter currentNotificationCenter];
+      electrobun::notificationCenterIfAvailable([NSBundle mainBundle]);
+  if (!center) {
+    showNotificationLegacy(titleStr, bodyStr, subtitleStr, silent);
+    return;
+  }
 
   // Request authorization if we haven't already
   if (!notificationAuthRequested) {
@@ -10592,9 +10708,12 @@ extern "C" void showNotification(const char *title, const char *body,
   if (!silent) {
     content.sound = [UNNotificationSound defaultSound];
   }
+  content.categoryIdentifier = kElectrobunNotificationCategory;
 
-  // Create a unique identifier for this notification
-  NSString *identifier = [[NSUUID UUID] UUIDString];
+  // Reusing an identifier replaces the notification already shown with it
+  NSString *identifier = notificationId && notificationId[0]
+                             ? [NSString stringWithUTF8String:notificationId]
+                             : [[NSUUID UUID] UUIDString];
 
   // Create the request with no trigger (immediate delivery)
   UNNotificationRequest *request =
@@ -10616,6 +10735,11 @@ extern "C" void showNotification(const char *title, const char *body,
                NSLog(@"Notification scheduled successfully: %@", titleStr);
              }
            }];
+}
+
+extern "C" void showNotification(const char *title, const char *body,
+                                 const char *subtitle, BOOL silent) {
+  showNotificationWithId(title, body, subtitle, silent, nullptr);
 }
 
 extern "C" const char *openFileDialog(const char *startingFolder,

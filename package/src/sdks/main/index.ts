@@ -32,6 +32,7 @@ import type {
 	MessageBoxOptions,
 	MessageBoxResponse,
 	NotificationOptions,
+	NotificationPermission,
 } from "./core/Utils";
 import {
 	type RPCSchema,
@@ -259,6 +260,7 @@ export {
 	type MessageBoxOptions,
 	type MessageBoxResponse,
 	type NotificationOptions,
+	type NotificationPermission,
 	type MenuItemConfig,
 	type ApplicationMenuItemConfig,
 	type Display,

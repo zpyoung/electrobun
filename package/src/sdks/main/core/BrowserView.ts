@@ -20,6 +20,16 @@ const BrowserViewMap: {
 
 const webviewTagCreatedEvent = Symbol("webview-tag-browser-view-created");
 
+/**
+ * Answers one request for an isolated preview's scheme. The response's status,
+ * headers and body are passed to WebKit unchanged.
+ */
+export type IsolatedPreviewHandler = (
+	request: Request,
+) => Response | Promise<Response>;
+
+const isolatedPreviewHandlers = new Map<number, IsolatedPreviewHandler>();
+
 type QueuedWebviewMessage = {
 	message: string;
 	markSent: () => void;
@@ -77,6 +87,14 @@ export type BrowserViewOptions<T = undefined> = {
 	// Adopts the popup announced by a "popup-request" event instead of
 	// creating an empty page. A sandboxed opener's popup needs sandbox: true.
 	popupRequestId: number;
+	// Creates a throwaway, sandboxed view whose documents and assets come only
+	// from `scheme`, answered by `handler`. Outbound network, permissions,
+	// downloads, popups and navigation off the scheme are blocked natively.
+	// Throws where unsupported; check BrowserView.isIsolatedPreviewSupported().
+	isolatedPreview: {
+		scheme: string;
+		handler?: IsolatedPreviewHandler;
+	} | null;
 	// renderer:
 };
 
@@ -172,6 +190,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	startPassthrough: boolean = false;
 	spellCheck: boolean = false;
 	popupRequestId?: number;
+	isolatedPreview: string | null = null;
 	isRemoved: boolean = false;
 
 	get ptr(): Pointer | null {
@@ -211,9 +230,29 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.startPassthrough = options.startPassthrough ?? false;
 		this.spellCheck = options.spellCheck ?? false;
 		this.popupRequestId = options.popupRequestId;
+		this.isolatedPreview = options.isolatedPreview?.scheme ?? null;
+		if (this.isolatedPreview !== null) {
+			if (!BrowserView.isIsolatedPreviewSupported()) {
+				throw new Error(
+					"Isolated preview views are not supported on this platform",
+				);
+			}
+			if (this.renderer !== "native") {
+				throw new Error("Isolated preview views require the native renderer");
+			}
+			if (this.html) {
+				throw new Error(
+					"Isolated preview views load only their own scheme, not html",
+				);
+			}
+			this.sandbox = true;
+		}
 
 		this.id = this.init() as number;
 		BrowserViewMap[this.id] = this;
+		if (options.isolatedPreview?.handler) {
+			isolatedPreviewHandlers.set(this.id, options.isolatedPreview.handler);
+		}
 
 		// If HTML content was provided, load it after webview creation.
 		if (this.html) {
@@ -251,6 +290,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 			startPassthrough: this.startPassthrough,
 			spellCheck: this.spellCheck,
 			popupRequestId: this.popupRequestId,
+			isolatedPreview: this.isolatedPreview,
 			// transparent is looked up from parent window in native.ts
 		});
 	}
@@ -315,6 +355,11 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 	}
 
 	loadHTML(html: string) {
+		if (this.isolatedPreview !== null) {
+			throw new Error(
+				"Isolated preview views load only their own scheme, not html",
+			);
+		}
 		this.html = html;
 
 		if (this.renderer === "cef") {
@@ -324,6 +369,19 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		} else {
 			// For WKWebView, load HTML content directly
 			ffi.request.loadHTMLInWebView({ id: this.id, html });
+		}
+	}
+
+	/**
+	 * Sets or replaces the handler answering this isolated preview's scheme,
+	 * including previews created by an <electrobun-webview isolated-preview>
+	 * tag. Without a handler every request gets a 404.
+	 */
+	setIsolatedPreviewHandler(handler: IsolatedPreviewHandler | null) {
+		if (handler) {
+			isolatedPreviewHandlers.set(this.id, handler);
+		} else {
+			isolatedPreviewHandlers.delete(this.id);
 		}
 	}
 
@@ -684,6 +742,7 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		this.resolveQueuedHostMessages();
 		// Drop JS-side references first so late callbacks cannot target a stale view.
 		delete BrowserViewMap[this.id];
+		isolatedPreviewHandlers.delete(this.id);
 		removeSocketForWebview(this.id);
 		this.rpc?.setTransport({
 			send() {},
@@ -700,6 +759,65 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 
 	static getById(id: number) {
 		return BrowserViewMap[id];
+	}
+
+	/** Whether this platform can create isolated preview views (macOS only). */
+	static isIsolatedPreviewSupported(): boolean {
+		return ffi.request.isolatedPreviewSupported();
+	}
+
+	// Internal: called for each native "isolated-preview-request" event.
+	static async answerIsolatedPreviewRequest(id: number, detail: string) {
+		let requestId = 0;
+		let status = 500;
+		let headers: Record<string, string> = {};
+		let body = new Uint8Array(0);
+		try {
+			const request = JSON.parse(detail) as {
+				requestId: number;
+				url: string;
+				method: string;
+				headers: Record<string, string>;
+				body?: string;
+			};
+			requestId = request.requestId;
+			const handler = isolatedPreviewHandlers.get(id);
+			const hasBody =
+				request.body !== undefined &&
+				request.method !== "GET" &&
+				request.method !== "HEAD";
+			const response = handler
+				? await handler(
+						new Request(request.url, {
+							method: request.method,
+							headers: request.headers,
+							body: hasBody
+								? new Uint8Array(Buffer.from(request.body!, "base64"))
+								: undefined,
+						}),
+					)
+				: new Response("Not found", { status: 404 });
+			body = new Uint8Array(await response.arrayBuffer());
+			status = response.status;
+			response.headers.forEach((value, name) => {
+				headers[name] = value;
+			});
+		} catch (error) {
+			console.error(`Isolated preview handler failed for webview ${id}:`, error);
+			status = 500;
+			headers = { "Content-Type": "text/plain; charset=utf-8" };
+			body = new TextEncoder().encode("Internal error");
+		}
+		if (!requestId || BrowserViewMap[id]?.isRemoved) {
+			return;
+		}
+		ffi.request.webviewIsolatedPreviewRespond({
+			id,
+			requestId,
+			status,
+			headers,
+			body,
+		});
 	}
 
 	// Core can create webviews before Bun has constructed a JS wrapper for them.

@@ -15,9 +15,11 @@ namespace electrobun {
 
 // Represents a single navigation rule
 // Rules starting with "^" are block rules (inverts the match)
+// Rules whose pattern starts with "frame:" apply only to subframe navigations
 struct NavigationRule {
     std::string pattern;
     bool isBlockRule;
+    bool isFrameRule;
 
     NavigationRule(const std::string& ruleString) {
         if (!ruleString.empty() && ruleString[0] == '^') {
@@ -27,6 +29,9 @@ struct NavigationRule {
             isBlockRule = false;
             pattern = ruleString;
         }
+        static const std::string framePrefix = "frame:";
+        isFrameRule = pattern.compare(0, framePrefix.size(), framePrefix) == 0;
+        if (isFrameRule) pattern = pattern.substr(framePrefix.size());
     }
 };
 
@@ -37,11 +42,14 @@ struct NavigationRule {
 // Rules are processed in order:
 // - Normal rules (no ^ prefix): if URL matches, allow navigation
 // - Block rules (^ prefix): if URL matches, block navigation
+// - Frame rules ("frame:" or "^frame:" prefix): considered only when
+//   isMainFrame is false, so an iframe can load a URL the top-level page can't
 // - Last matching rule determines the outcome
 // - If no rules match, returns defaultAllow
 inline bool checkNavigationRulesForUrl(const std::vector<std::string>& rules,
                                        const std::string& url,
-                                       bool defaultAllow = true) {
+                                       bool defaultAllow = true,
+                                       bool isMainFrame = true) {
     bool shouldAllow = defaultAllow;
     bool anyMatch = false;
 
@@ -49,6 +57,7 @@ inline bool checkNavigationRulesForUrl(const std::vector<std::string>& rules,
         if (ruleString.empty()) continue;
 
         NavigationRule rule(ruleString);
+        if (rule.isFrameRule && isMainFrame) continue;
 
         if (globMatch(rule.pattern, url)) {
             anyMatch = true;
@@ -64,7 +73,8 @@ inline bool checkNavigationRulesForUrl(const std::vector<std::string>& rules,
 // Overload that takes a comma-separated rules string
 inline bool checkNavigationRulesForUrl(const std::string& rulesString,
                                        const std::string& url,
-                                       bool defaultAllow = true) {
+                                       bool defaultAllow = true,
+                                       bool isMainFrame = true) {
     std::vector<std::string> rules;
 
     size_t start = 0;
@@ -90,7 +100,7 @@ inline bool checkNavigationRulesForUrl(const std::string& rulesString,
         rules.push_back(rule.substr(first, last - first + 1));
     }
 
-    return checkNavigationRulesForUrl(rules, url, defaultAllow);
+    return checkNavigationRulesForUrl(rules, url, defaultAllow, isMainFrame);
 }
 
 } // namespace electrobun

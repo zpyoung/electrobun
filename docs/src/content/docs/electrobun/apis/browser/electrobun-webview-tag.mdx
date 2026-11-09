@@ -113,6 +113,12 @@ webview.setNavigationRules([
 
 An empty rules array restores the default allow behavior.
 
+Prefix a pattern with `frame:` (or `^frame:` to block) to make the rule apply
+only to iframe navigations, for example `"frame:about:srcdoc"` to let the page
+render `srcdoc` iframes under a `"^*"` policy. Frame rules apply on macOS only;
+elsewhere they never match. See
+[BrowserView navigation rules](/electrobun/apis/browser-view/#loading-and-scripting).
+
 ## Visibility And Input
 
 The toggle methods accept an explicit state. Omit it to invert the current

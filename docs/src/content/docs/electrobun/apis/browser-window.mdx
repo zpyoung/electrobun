@@ -155,7 +155,7 @@ with no argument uses the legacy starter window: title `"Electrobun"`, size
 | `hidden` | `boolean` | `false` | Create without showing the window. |
 | `activate` | `boolean` | `true` | Activate the window when it is created. |
 | `trafficLightOffset` | `{ x: number; y: number }` | `{ x: 0, y: 0 }` | macOS traffic-light offset. |
-| `navigationRules` | `string \| null` | `null` | Serialized navigation policy for the initial webview. |
+| `navigationRules` | `string \| null` | `null` | Serialized navigation policy for the initial webview, as a JSON array of rules. See [navigation rules](/electrobun/apis/browser-view/#loading-and-scripting), including `frame:` rules for iframes. |
 | `sandbox` | `boolean` | `false` | Disable RPC for untrusted content; event emission remains available. |
 
 Only bundle and select CEF when the app needs it. See

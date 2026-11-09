@@ -985,6 +985,7 @@ void releaseObjCObject(id objcObject) {
 
 - (void)setNavigationRulesFromJSON:(const char *)rulesJson;
 - (BOOL)shouldAllowNavigationToURL:(NSString *)url;
+- (BOOL)shouldAllowNavigationToURL:(NSString *)url isMainFrame:(BOOL)isMainFrame;
 
 - (void)findInPage:(const char *)searchText
            forward:(BOOL)forward
@@ -1686,24 +1687,21 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 }
 
 - (BOOL)shouldAllowNavigationToURL:(NSString *)url {
+  return [self shouldAllowNavigationToURL:url isMainFrame:YES];
+}
+
+- (BOOL)shouldAllowNavigationToURL:(NSString *)url isMainFrame:(BOOL)isMainFrame {
   if (!self.navigationRules || self.navigationRules.count == 0) {
     return YES; // Default allow if no rules
   }
 
-  BOOL allowed = YES; // Default allow if no rules match
-  std::string urlStr = [url UTF8String] ?: "";
-
+  std::vector<std::string> rules;
+  rules.reserve(self.navigationRules.count);
   for (NSString *rule in self.navigationRules) {
-    BOOL isBlockRule = [rule hasPrefix:@"^"];
-    NSString *pattern = isBlockRule ? [rule substringFromIndex:1] : rule;
-    std::string patternStr = [pattern UTF8String] ?: "";
-
-    if (electrobun::globMatch(patternStr, urlStr)) {
-      allowed = !isBlockRule; // Last match wins
-    }
+    rules.emplace_back([rule UTF8String] ?: "");
   }
-
-  return allowed;
+  return electrobun::checkNavigationRulesForUrl(
+      rules, [url UTF8String] ?: "", true, isMainFrame);
 }
 
 - (void)findInPage:(const char *)searchText
@@ -2477,9 +2475,13 @@ static void schedulePendingResizeDrain() {
   // Check navigation rules synchronously from native-stored rules
   AbstractView *abstractView =
       [globalAbstractViews objectForKey:@(self.webviewId)];
+  // a nil target frame is a new window, which is a top-level page
+  WKFrameInfo *targetFrame = navigationAction.targetFrame;
+  BOOL isMainFrame = !targetFrame || targetFrame.isMainFrame;
   BOOL shouldAllow =
       abstractView
-          ? [abstractView shouldAllowNavigationToURL:newURL.absoluteString]
+          ? [abstractView shouldAllowNavigationToURL:newURL.absoluteString
+                                         isMainFrame:isMainFrame]
           : YES;
 
   // Fire will-navigate event with allowed status
@@ -6353,8 +6355,10 @@ public:
         [globalAbstractViews objectForKey:@(webview_id_)];
     bool shouldAllow =
         abstractView
-            ? [abstractView shouldAllowNavigationToURL:
-                                [NSString stringWithUTF8String:url.c_str()]]
+            ? [abstractView
+                  shouldAllowNavigationToURL:[NSString
+                                                 stringWithUTF8String:url.c_str()]
+                                 isMainFrame:!frame || frame->IsMain()]
             : true;
 
     // Escape special characters in URL for JSON event

@@ -291,6 +291,11 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		}
 	}
 
+	/**
+	 * Sets the native navigation policy. `*` is a wildcard, `^` blocks, the last
+	 * matching rule wins and no match allows. A `frame:` or `^frame:` rule applies
+	 * only to iframe navigations (macOS only; it never matches elsewhere).
+	 */
 	setNavigationRules(rules: string[]) {
 		this.navigationRules = JSON.stringify(rules);
 		const rulesJson = JSON.stringify(rules);

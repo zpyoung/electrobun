@@ -31,6 +31,7 @@ static bool wgpuDebugEnabled() {
 #include "drop_source_paths.h"
 #include "inspector_layout.h"
 #include "load_failed.h"
+#include "native_requests.h"
 #include "spell_check.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
@@ -1089,6 +1090,9 @@ void releaseObjCObject(id objcObject) {
 @property(nonatomic, assign) BOOL pendingStartPassthrough;
 @property(nonatomic, assign) BOOL pendingSpellCheckConfigured;
 @property(nonatomic, assign) BOOL pendingSpellCheckEnabled;
+@property(nonatomic, assign) uint32_t pendingPopupRequestId;
+@property(nonatomic, assign) uint32_t nativeRequestKinds;
+@property(nonatomic, assign) double nativeRequestTimeoutMs;
 @property(nonatomic, strong) CALayer *storedLayerMask;
 @property(nonatomic, strong) NSArray<NSString *> *navigationRules;
 @property(atomic, assign) uint32_t resizeGeneration;
@@ -1112,6 +1116,7 @@ void releaseObjCObject(id objcObject) {
 - (BOOL)shouldSuppressMirrorMode;
 - (BOOL)setSpellCheck:(BOOL)enabled;
 - (BOOL)supportsDropSourcePaths;
+- (BOOL)setNativeRequestHandling:(uint32_t)kinds timeoutMs:(double)timeoutMs;
 
 - (BOOL)canGoBack;
 - (BOOL)canGoForward;
@@ -1160,6 +1165,13 @@ void releaseObjCObject(id objcObject) {
 static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews =
     nil;
 
+// Pending native page requests and the popups parked until a view adopts them.
+// Both are only touched on the main thread.
+static electrobun::NativeRequestRegistry g_nativeRequests;
+static NSMutableDictionary<NSNumber *, ElectrobunParkedPopup *> *g_parkedPopups =
+    nil;
+static uint32_t g_nextDownloadId = 1;
+
 // OSR (Off-Screen Rendering) View for transparent CEF windows
 @interface CEFOSRView : NSView {
 @private
@@ -1204,9 +1216,12 @@ static NSMutableDictionary<NSNumber *, AbstractView *> *globalAbstractViews =
 @property(nonatomic, strong)
     NSMutableDictionary<NSValue *, NSString *> *downloadPaths;
 @property(nonatomic, strong) NSMutableSet<WKDownload *> *observedDownloads;
+@property(nonatomic, strong)
+    NSMutableDictionary<NSNumber *, WKDownload *> *activeDownloads;
 @property(nonatomic, assign) BOOL spellCheckConfigured;
 @property(nonatomic, assign) BOOL spellCheckEnabled;
 @property(nonatomic, assign) BOOL hasFinishedNavigation;
+- (BOOL)cancelDownloadWithId:(uint32_t)downloadId API_AVAILABLE(macos(11.3));
 @end
 
 @interface MyWebViewUIDelegate : NSObject <WKUIDelegate>
@@ -1699,6 +1714,12 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 }
 
 - (BOOL)supportsLoadFailed {
+  return NO;
+}
+
+- (BOOL)setNativeRequestHandling:(uint32_t)kinds timeoutMs:(double)timeoutMs {
+  (void)kinds;
+  (void)timeoutMs;
   return NO;
 }
 
@@ -2611,6 +2632,79 @@ static void schedulePendingResizeDrain() {
 }
 @end
 
+// Returns the view when it opted in to answering this kind of native request.
+static AbstractView *nativeRequestView(uint32_t webviewId, uint32_t kind) {
+  AbstractView *view = [globalAbstractViews objectForKey:@(webviewId)];
+  if (!view || view.isRemoved || (view.nativeRequestKinds & kind) == 0) {
+    return nil;
+  }
+  return view;
+}
+
+static void emitWebviewEvent(WebviewEventHandler handler, uint32_t webviewId,
+                             const char *eventName, NSDictionary *details) {
+  if (!handler) {
+    return;
+  }
+  handler(webviewId, strdup(eventName),
+          strdup(electrobun::eventJSON(details).UTF8String));
+}
+
+// Registers the request before announcing it, so a response can never arrive
+// for an id the registry does not know yet.
+static uint32_t startNativeRequest(AbstractView *view,
+                                   WebviewEventHandler handler,
+                                   const char *eventName, NSDictionary *details,
+                                   electrobun::NativeRequestResolver resolver) {
+  uint32_t webviewId = view.webviewId;
+  uint32_t requestId = g_nativeRequests.add(
+      webviewId, view.nativeRequestTimeoutMs, resolver,
+      ^(uint32_t expiredRequestId, NSString *reason) {
+        emitWebviewEvent(handler, webviewId, "native-request-expired",
+                         @{@"requestId" : @(expiredRequestId),
+                           @"reason" : reason});
+      });
+  NSMutableDictionary *payload = [details mutableCopy];
+  payload[@"requestId"] = @(requestId);
+  emitWebviewEvent(handler, webviewId, eventName, payload);
+  return requestId;
+}
+
+static NSDictionary *dialogDetails(NSString *type, NSString *message,
+                                   NSString *defaultText, WKFrameInfo *frame) {
+  NSMutableDictionary *details =
+      [electrobun::frameDetails(frame) mutableCopy];
+  details[@"type"] = type;
+  details[@"message"] = message ?: @"";
+  if (defaultText) {
+    details[@"defaultText"] = defaultText;
+  }
+  return details;
+}
+
+static NSDictionary *protectionSpaceDetails(NSURLProtectionSpace *space) {
+  NSString *protocol = space.protocol ?: @"";
+  NSString *origin =
+      space.port > 0
+          ? [NSString stringWithFormat:@"%@://%@:%ld", protocol, space.host,
+                                       (long)space.port]
+          : [NSString stringWithFormat:@"%@://%@", protocol, space.host];
+  return @{
+    @"origin" : origin,
+    @"host" : space.host ?: @"",
+    @"port" : @(space.port),
+    @"protocol" : protocol,
+    @"isProxy" : @(space.isProxy),
+  };
+}
+
+static BOOL isPasswordAuthenticationMethod(NSString *method) {
+  return [method isEqualToString:NSURLAuthenticationMethodHTTPBasic] ||
+         [method isEqualToString:NSURLAuthenticationMethodHTTPDigest] ||
+         [method isEqualToString:NSURLAuthenticationMethodNTLM] ||
+         [method isEqualToString:NSURLAuthenticationMethodNegotiate];
+}
+
 @implementation MyNavigationDelegate
 - (void)webView:(WKWebView *)webView
     decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
@@ -2632,6 +2726,30 @@ static void schedulePendingResizeDrain() {
     self.zigEventHandler(self.webviewId, strdup("new-window-open"),
                          strdup([eventData UTF8String]));
     decisionHandler(WKNavigationActionPolicyCancel);
+    return;
+  }
+
+  AbstractView *externalAppView =
+      nativeRequestView(self.webviewId, electrobun::NativeRequestExternalApp);
+  if (externalAppView &&
+      electrobun::isExternalAppURL(newURL, webView.configuration)) {
+    // WKWebView cannot load these itself; the app decides whether the OS
+    // opens the URL in another application.
+    decisionHandler(WKNavigationActionPolicyCancel);
+    NSMutableDictionary *details =
+        [electrobun::frameDetails(navigationAction.sourceFrame) mutableCopy];
+    details[@"url"] = newURL.absoluteString ?: @"";
+    details[@"scheme"] = newURL.scheme.lowercaseString ?: @"";
+    details[@"isUserGesture"] =
+        @(navigationAction.navigationType == WKNavigationTypeLinkActivated ||
+          navigationAction.navigationType == WKNavigationTypeFormSubmitted);
+    startNativeRequest(externalAppView, self.zigEventHandler,
+                       "external-app-request", details,
+                       ^(NSDictionary *response) {
+                         if (electrobun::responseAccepted(response)) {
+                           [[NSWorkspace sharedWorkspace] openURL:newURL];
+                         }
+                       });
     return;
   }
 
@@ -2676,6 +2794,81 @@ static void schedulePendingResizeDrain() {
 }
 
 - (void)webView:(WKWebView *)webView
+    didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge
+                    completionHandler:
+                        (void (^)(NSURLSessionAuthChallengeDisposition,
+                                  NSURLCredential *))completionHandler {
+  NSURLProtectionSpace *space = challenge.protectionSpace;
+  NSString *method = space.authenticationMethod;
+
+  if ([method isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+    AbstractView *view =
+        nativeRequestView(self.webviewId, electrobun::NativeRequestCertificate);
+    SecTrustRef trust = space.serverTrust;
+    if (!view || !trust) {
+      completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+      return;
+    }
+    WebviewEventHandler handler = self.zigEventHandler;
+    CFRetain(trust);
+    SecTrustEvaluateAsyncWithError(
+        trust, dispatch_get_main_queue(), ^(SecTrustRef evaluated, bool trusted,
+                                            CFErrorRef error) {
+          (void)evaluated;
+          if (trusted || view.isRemoved) {
+            CFRelease(trust);
+            completionHandler(NSURLSessionAuthChallengePerformDefaultHandling,
+                              nil);
+            return;
+          }
+          NSMutableDictionary *details =
+              [protectionSpaceDetails(space) mutableCopy];
+          details[@"error"] =
+              error ? ((__bridge NSError *)error).localizedDescription : @"";
+          startNativeRequest(
+              view, handler, "certificate-request", details,
+              ^(NSDictionary *response) {
+                if (electrobun::responseAccepted(response)) {
+                  completionHandler(
+                      NSURLSessionAuthChallengeUseCredential,
+                      [NSURLCredential credentialForTrust:trust]);
+                } else {
+                  completionHandler(
+                      NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                      nil);
+                }
+                CFRelease(trust);
+              });
+        });
+    return;
+  }
+
+  AbstractView *authView =
+      isPasswordAuthenticationMethod(method)
+          ? nativeRequestView(self.webviewId, electrobun::NativeRequestAuth)
+          : nil;
+  if (!authView) {
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+    return;
+  }
+  NSMutableDictionary *details = [protectionSpaceDetails(space) mutableCopy];
+  details[@"realm"] = space.realm ?: @"";
+  details[@"authenticationMethod"] = method;
+  details[@"previousFailureCount"] = @(challenge.previousFailureCount);
+  startNativeRequest(
+      authView, self.zigEventHandler, "auth-request", details,
+      ^(NSDictionary *response) {
+        NSURLCredential *credential =
+            electrobun::credentialForAuthResponse(response);
+        completionHandler(
+            credential
+                ? NSURLSessionAuthChallengeUseCredential
+                : NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+            credential);
+      });
+}
+
+- (void)webView:(WKWebView *)webView
     didFinishNavigation:(WKNavigation *)navigation {
   self.hasFinishedNavigation = YES;
   if (self.spellCheckConfigured) {
@@ -2716,7 +2909,7 @@ static void schedulePendingResizeDrain() {
      navigationAction:(WKNavigationAction *)navigationAction
     didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
   NSLog(@"DEBUG WKWebView Download: Navigation action became download");
-  download.delegate = self;
+  [self trackDownload:download];
 }
 
 // Called when navigationResponse policy returns .download
@@ -2724,7 +2917,35 @@ static void schedulePendingResizeDrain() {
     navigationResponse:(WKNavigationResponse *)navigationResponse
      didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
   NSLog(@"DEBUG WKWebView Download: Navigation response became download");
+  [self trackDownload:download];
+}
+
+- (void)trackDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
   download.delegate = self;
+  if (!self.activeDownloads) {
+    self.activeDownloads = [NSMutableDictionary dictionary];
+  }
+  uint32_t downloadId = g_nextDownloadId++;
+  self.activeDownloads[@(downloadId)] = download;
+}
+
+- (NSNumber *)idForDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+  return [self.activeDownloads allKeysForObject:download].firstObject;
+}
+
+- (BOOL)cancelDownloadWithId:(uint32_t)downloadId API_AVAILABLE(macos(11.3)) {
+  WKDownload *download = self.activeDownloads[@(downloadId)];
+  if (!download) {
+    return NO;
+  }
+  [download cancel:^(NSData *resumeData) {
+    (void)resumeData;
+    [self finishDownload:download
+                   error:[NSError errorWithDomain:NSURLErrorDomain
+                                             code:NSURLErrorCancelled
+                                         userInfo:nil]];
+  }];
+  return YES;
 }
 
 // WKDownloadDelegate methods
@@ -2737,104 +2958,137 @@ static void schedulePendingResizeDrain() {
   NSLog(@"DEBUG WKWebView Download: Deciding destination for %@",
         suggestedFilename);
 
+  if (![self idForDownload:download]) {
+    [self trackDownload:download];
+  }
+  NSNumber *downloadId = [self idForDownload:download];
+  AbstractView *view =
+      nativeRequestView(self.webviewId, electrobun::NativeRequestDownload);
+  if (view) {
+    NSMutableDictionary *details =
+        [electrobun::frameDetails(download.originatingFrame) mutableCopy];
+    details[@"downloadId"] = downloadId;
+    details[@"url"] = download.originalRequest.URL.absoluteString ?: @"";
+    details[@"suggestedFilename"] = suggestedFilename ?: @"";
+    details[@"mimeType"] = response.MIMEType ?: @"";
+    details[@"expectedBytes"] = @(response.expectedContentLength);
+    startNativeRequest(
+        view, self.zigEventHandler, "download-request", details,
+        ^(NSDictionary *answer) {
+          NSString *path =
+              electrobun::responseAccepted(answer)
+                  ? electrobun::uniqueDownloadPath(
+                        electrobun::responseString(answer, @"path"))
+                  : nil;
+          completionHandler(path ? [self startDownload:download
+                                                atPath:path
+                                     suggestedFilename:suggestedFilename]
+                                 : nil);
+        });
+    return;
+  }
+
   // Get the Downloads folder
   NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory,
                                                        NSUserDomainMask, YES);
   NSString *downloadsDirectory = [paths firstObject];
+  NSString *destinationPath =
+      downloadsDirectory
+          ? electrobun::uniqueDownloadPath([downloadsDirectory
+                stringByAppendingPathComponent:suggestedFilename])
+          : nil;
 
-  if (downloadsDirectory) {
-    NSString *destinationPath =
-        [downloadsDirectory stringByAppendingPathComponent:suggestedFilename];
-
-    // Handle duplicate filenames by appending a number
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    NSString *basePath = [destinationPath stringByDeletingPathExtension];
-    NSString *extension = [destinationPath pathExtension];
-    int counter = 1;
-
-    while ([fileManager fileExistsAtPath:destinationPath]) {
-      if (extension.length > 0) {
-        destinationPath = [NSString
-            stringWithFormat:@"%@ (%d).%@", basePath, counter, extension];
-      } else {
-        destinationPath =
-            [NSString stringWithFormat:@"%@ (%d)", basePath, counter];
-      }
-      counter++;
-    }
-
-    NSURL *destinationURL = [NSURL fileURLWithPath:destinationPath];
+  if (destinationPath) {
     NSLog(@"DEBUG WKWebView Download: Saving to %@", destinationPath);
-
-    // Store the path for this download so we can reference it in completion
-    // handlers
-    if (!self.downloadPaths) {
-      self.downloadPaths = [NSMutableDictionary dictionary];
-    }
-    [self.downloadPaths
-        setObject:destinationPath
-           forKey:[NSValue valueWithNonretainedObject:download]];
-
-    // Observe download progress via KVO
-    if (!self.observedDownloads) {
-      self.observedDownloads = [NSMutableSet set];
-    }
-    [self.observedDownloads addObject:download];
-    [download.progress addObserver:self
-                        forKeyPath:@"fractionCompleted"
-                           options:NSKeyValueObservingOptionNew
-                           context:NULL];
-
-    // Send download-started event
-    if (self.zigEventHandler) {
-      // Use NSJSONSerialization for proper escaping
-      NSDictionary *eventDict =
-          @{@"filename" : suggestedFilename, @"path" : destinationPath};
-      NSData *jsonData = [NSJSONSerialization dataWithJSONObject:eventDict
-                                                         options:0
-                                                           error:nil];
-      NSString *eventData =
-          [[NSString alloc] initWithData:jsonData
-                                encoding:NSUTF8StringEncoding];
-      self.zigEventHandler(self.webviewId, strdup("download-started"),
-                           strdup([eventData UTF8String]));
-    }
-
-    completionHandler(destinationURL);
+    completionHandler([self startDownload:download
+                                   atPath:destinationPath
+                        suggestedFilename:suggestedFilename]);
   } else {
     NSLog(@"ERROR WKWebView Download: Could not find Downloads directory");
     completionHandler(nil);
   }
 }
 
-- (void)downloadDidFinish:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
-  NSLog(@"DEBUG WKWebView Download: Download finished successfully");
+- (NSURL *)startDownload:(WKDownload *)download
+                   atPath:(NSString *)destinationPath
+        suggestedFilename:(NSString *)suggestedFilename
+    API_AVAILABLE(macos(11.3)) {
+  // Store the path for this download so we can reference it in completion
+  // handlers
+  if (!self.downloadPaths) {
+    self.downloadPaths = [NSMutableDictionary dictionary];
+  }
+  [self.downloadPaths setObject:destinationPath
+                         forKey:[NSValue valueWithNonretainedObject:download]];
+
+  // Observe download progress via KVO
+  if (!self.observedDownloads) {
+    self.observedDownloads = [NSMutableSet set];
+  }
+  NSNumber *downloadId = [self idForDownload:download] ?: @0;
+  [self.observedDownloads addObject:download];
+  // Progress can be reported off the main thread, so the id rides along in
+  // the KVO context instead of being looked up from shared state.
+  [download.progress addObserver:self
+                      forKeyPath:@"fractionCompleted"
+                         options:NSKeyValueObservingOptionNew
+                         context:(void *)(uintptr_t)downloadId.unsignedIntValue];
+
+  emitWebviewEvent(self.zigEventHandler, self.webviewId, "download-started", @{
+    @"id" : downloadId,
+    @"filename" : suggestedFilename ?: destinationPath.lastPathComponent,
+    @"path" : destinationPath
+  });
+
+  return [NSURL fileURLWithPath:destinationPath];
+}
+
+// Reports the outcome once, whether WebKit or a cancel reported it first.
+- (void)finishDownload:(WKDownload *)download
+                 error:(NSError *)error API_AVAILABLE(macos(11.3)) {
+  NSNumber *downloadId = [self idForDownload:download];
+  if (!downloadId) {
+    return;
+  }
+  [self.activeDownloads removeObjectForKey:downloadId];
 
   // Remove KVO observer
   if ([self.observedDownloads containsObject:download]) {
-    [download.progress removeObserver:self forKeyPath:@"fractionCompleted"];
+    [download.progress
+        removeObserver:self
+            forKeyPath:@"fractionCompleted"
+               context:(void *)(uintptr_t)downloadId.unsignedIntValue];
     [self.observedDownloads removeObject:download];
   }
 
-  // Send download-completed event
-  if (self.zigEventHandler) {
-    NSString *path = [self.downloadPaths
-        objectForKey:[NSValue valueWithNonretainedObject:download]];
-    NSString *filename = [path lastPathComponent] ?: @"";
-    // Use NSJSONSerialization for proper escaping
-    NSDictionary *eventDict = @{@"filename" : filename, @"path" : path ?: @""};
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:eventDict
-                                                       options:0
-                                                         error:nil];
-    NSString *eventData = [[NSString alloc] initWithData:jsonData
-                                                encoding:NSUTF8StringEncoding];
-    self.zigEventHandler(self.webviewId, strdup("download-completed"),
-                         strdup([eventData UTF8String]));
+  NSValue *downloadKey = [NSValue valueWithNonretainedObject:download];
+  NSString *path = [self.downloadPaths objectForKey:downloadKey];
+  [self.downloadPaths removeObjectForKey:downloadKey];
+  NSString *filename = [path lastPathComponent] ?: @"";
 
-    // Clean up
-    [self.downloadPaths
-        removeObjectForKey:[NSValue valueWithNonretainedObject:download]];
+  if (!error) {
+    emitWebviewEvent(self.zigEventHandler, self.webviewId,
+                     "download-completed",
+                     @{@"id" : downloadId,
+                       @"filename" : filename,
+                       @"path" : path ?: @""});
+    return;
   }
+
+  BOOL cancelled = [error.domain isEqualToString:NSURLErrorDomain] &&
+                   error.code == NSURLErrorCancelled;
+  emitWebviewEvent(self.zigEventHandler, self.webviewId, "download-failed", @{
+    @"id" : downloadId,
+    @"filename" : filename,
+    @"path" : path ?: @"",
+    @"error" : error.localizedDescription ?: @"",
+    @"cancelled" : @(cancelled)
+  });
+}
+
+- (void)downloadDidFinish:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+  NSLog(@"DEBUG WKWebView Download: Download finished successfully");
+  [self finishDownload:download error:nil];
 }
 
 - (void)download:(WKDownload *)download
@@ -2842,36 +3096,7 @@ static void schedulePendingResizeDrain() {
           resumeData:(NSData *)resumeData API_AVAILABLE(macos(11.3)) {
   NSLog(@"ERROR WKWebView Download: Download failed with error: %@",
         error.localizedDescription);
-
-  // Remove KVO observer
-  if ([self.observedDownloads containsObject:download]) {
-    [download.progress removeObserver:self forKeyPath:@"fractionCompleted"];
-    [self.observedDownloads removeObject:download];
-  }
-
-  // Send download-failed event
-  if (self.zigEventHandler) {
-    NSString *path = [self.downloadPaths
-        objectForKey:[NSValue valueWithNonretainedObject:download]];
-    NSString *filename = [path lastPathComponent] ?: @"";
-    // Use NSJSONSerialization for proper escaping
-    NSDictionary *eventDict = @{
-      @"filename" : filename,
-      @"path" : path ?: @"",
-      @"error" : error.localizedDescription
-    };
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:eventDict
-                                                       options:0
-                                                         error:nil];
-    NSString *eventData = [[NSString alloc] initWithData:jsonData
-                                                encoding:NSUTF8StringEncoding];
-    self.zigEventHandler(self.webviewId, strdup("download-failed"),
-                         strdup([eventData UTF8String]));
-
-    // Clean up
-    [self.downloadPaths
-        removeObjectForKey:[NSValue valueWithNonretainedObject:download]];
-  }
+  [self finishDownload:download error:error];
 }
 
 // KVO observer for download progress
@@ -2882,14 +3107,14 @@ static void schedulePendingResizeDrain() {
   if ([keyPath isEqualToString:@"fractionCompleted"]) {
     NSProgress *progress = (NSProgress *)object;
     int percent = (int)(progress.fractionCompleted * 100);
+    NSNumber *downloadId = @((uint32_t)(uintptr_t)context);
 
     // Send download-progress event
-    if (self.zigEventHandler) {
-      NSString *eventData =
-          [NSString stringWithFormat:@"{\"progress\":%d}", percent];
-      self.zigEventHandler(self.webviewId, strdup("download-progress"),
-                           strdup([eventData UTF8String]));
-    }
+    emitWebviewEvent(self.zigEventHandler, self.webviewId, "download-progress",
+                     @{@"id" : downloadId,
+                       @"progress" : @(percent),
+                       @"receivedBytes" : @(progress.completedUnitCount),
+                       @"totalBytes" : @(progress.totalUnitCount)});
   }
 }
 @end
@@ -2904,6 +3129,17 @@ static void schedulePendingResizeDrain() {
   BOOL isCmdClick =
       (navigationAction.modifierFlags & NSEventModifierFlagCommand) != 0;
   BOOL isNewWindow = !navigationAction.targetFrame.isMainFrame || isCmdClick;
+
+  AbstractView *opener =
+      isNewWindow && !isCmdClick
+          ? nativeRequestView(self.webviewId, electrobun::NativeRequestPopup)
+          : nil;
+  if (opener) {
+    return [self parkPopupWithConfiguration:configuration
+                                     opener:opener
+                           navigationAction:navigationAction
+                             windowFeatures:windowFeatures];
+  }
 
   if (isNewWindow) {
     NSString *eventData = [NSString
@@ -2924,6 +3160,106 @@ static void schedulePendingResizeDrain() {
     }
   }
   return nil;
+}
+
+// WebKit requires the returned view to be built from its configuration, which
+// is what keeps window.opener, the target name and a POST body intact. The
+// popup waits, with its first navigation held, until the app adopts it into a
+// BrowserView or the request expires.
+- (WKWebView *)parkPopupWithConfiguration:(WKWebViewConfiguration *)configuration
+                                   opener:(AbstractView *)opener
+                         navigationAction:(WKNavigationAction *)navigationAction
+                           windowFeatures:(WKWindowFeatures *)windowFeatures {
+  ElectrobunParkedPopup *popup =
+      [[ElectrobunParkedPopup alloc] initWithConfiguration:configuration];
+  popup.openerWebviewId = self.webviewId;
+  popup.openerSandboxed = opener.isSandboxed;
+
+  NSMutableDictionary *details =
+      [electrobun::frameDetails(navigationAction.sourceFrame) mutableCopy];
+  details[@"url"] = navigationAction.request.URL.absoluteString ?: @"";
+  details[@"method"] = navigationAction.request.HTTPMethod ?: @"GET";
+  details[@"windowFeatures"] = @{
+    @"x" : windowFeatures.x ?: [NSNull null],
+    @"y" : windowFeatures.y ?: [NSNull null],
+    @"width" : windowFeatures.width ?: [NSNull null],
+    @"height" : windowFeatures.height ?: [NSNull null],
+  };
+
+  if (!g_parkedPopups) {
+    g_parkedPopups = [NSMutableDictionary dictionary];
+  }
+  __block uint32_t requestId = 0;
+  requestId = startNativeRequest(opener, self.zigEventHandler, "popup-request",
+                                 details, ^(NSDictionary *response) {
+                                   (void)response;
+                                   [g_parkedPopups
+                                       removeObjectForKey:@(requestId)];
+                                   if (!popup.adopting) {
+                                     [popup discard];
+                                   }
+                                 });
+  g_parkedPopups[@(requestId)] = popup;
+  return popup.webView;
+}
+
+- (void)webViewDidClose:(WKWebView *)webView {
+  emitWebviewEvent(self.zigEventHandler, self.webviewId, "close-requested",
+                   @{});
+}
+
+- (void)webView:(WKWebView *)webView
+    runJavaScriptAlertPanelWithMessage:(NSString *)message
+                      initiatedByFrame:(WKFrameInfo *)frame
+                     completionHandler:(void (^)(void))completionHandler {
+  AbstractView *view =
+      nativeRequestView(self.webviewId, electrobun::NativeRequestDialog);
+  if (!view) {
+    completionHandler();
+    return;
+  }
+  startNativeRequest(view, self.zigEventHandler, "dialog-request",
+                     dialogDetails(@"alert", message, nil, frame),
+                     ^(NSDictionary *response) {
+                       (void)response;
+                       completionHandler();
+                     });
+}
+
+- (void)webView:(WKWebView *)webView
+    runJavaScriptConfirmPanelWithMessage:(NSString *)message
+                        initiatedByFrame:(WKFrameInfo *)frame
+                       completionHandler:(void (^)(BOOL))completionHandler {
+  AbstractView *view =
+      nativeRequestView(self.webviewId, electrobun::NativeRequestDialog);
+  if (!view) {
+    completionHandler(NO);
+    return;
+  }
+  startNativeRequest(view, self.zigEventHandler, "dialog-request",
+                     dialogDetails(@"confirm", message, nil, frame),
+                     ^(NSDictionary *response) {
+                       completionHandler(electrobun::responseAccepted(response));
+                     });
+}
+
+- (void)webView:(WKWebView *)webView
+    runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+                              defaultText:(NSString *)defaultText
+                         initiatedByFrame:(WKFrameInfo *)frame
+                        completionHandler:
+                            (void (^)(NSString *_Nullable))completionHandler {
+  AbstractView *view =
+      nativeRequestView(self.webviewId, electrobun::NativeRequestDialog);
+  if (!view) {
+    completionHandler(nil);
+    return;
+  }
+  startNativeRequest(view, self.zigEventHandler, "dialog-request",
+                     dialogDetails(@"prompt", prompt, defaultText ?: @"", frame),
+                     ^(NSDictionary *response) {
+                       completionHandler(electrobun::promptResult(response));
+                     });
 }
 
 // Handle file input elements (<input type="file">)
@@ -3195,6 +3531,9 @@ static void schedulePendingResizeDrain() {
     // and then call init from zig after the handle is added to the webviewMap
     // then we don't need this async stuff
     dispatch_async(dispatch_get_main_queue(), ^{
+      ElectrobunParkedPopup *popup =
+          [self adoptParkedPopup:self.pendingPopupRequestId sandbox:sandbox];
+
       // configuration
       WKWebViewConfiguration *configuration =
           [[WKWebViewConfiguration alloc] init];
@@ -3224,18 +3563,24 @@ static void schedulePendingResizeDrain() {
       [configuration setURLSchemeHandler:assetSchemeHandler
                             forURLScheme:@"appdata"];
 
-      // create WKWebView
-      ElectrobunWKWebView *webView =
-          [[ElectrobunWKWebView alloc] initWithFrame:frame
-                                       configuration:configuration];
-      webView.dropSourcePathsHandler = ^(NSArray<NSString *> *paths) {
-        NSString *detail = electrobun::dropSourcePathsEventDetail(paths);
-        if (webviewEventHandler && detail) {
-          webviewEventHandler(webviewId, strdup("drop-source-paths"),
-                              strdup([detail UTF8String]));
-        }
-      };
-      self.webView = webView;
+      // create WKWebView, or take over the popup WebKit already created with
+      // the opener's configuration
+      if (popup) {
+        self.webView = popup.webView;
+        self.webView.frame = frame;
+      } else {
+        ElectrobunWKWebView *webView =
+            [[ElectrobunWKWebView alloc] initWithFrame:frame
+                                         configuration:configuration];
+        webView.dropSourcePathsHandler = ^(NSArray<NSString *> *paths) {
+          NSString *detail = electrobun::dropSourcePathsEventDetail(paths);
+          if (webviewEventHandler && detail) {
+            webviewEventHandler(webviewId, strdup("drop-source-paths"),
+                                strdup([detail UTF8String]));
+          }
+        };
+        self.webView = webView;
+      }
 
       // Only set transparent background for main window webviews
       // (autoResize/fullscreen) Child webviews (OOPIFs) need a visible
@@ -3417,7 +3762,9 @@ static void schedulePendingResizeDrain() {
       }
 
       // Only load URL if it's provided and no HTML content exists
-      if (url && strlen(url) > 0) {
+      if (popup) {
+        [popup releaseToNavigationDelegate:navigationDelegate];
+      } else if (url && strlen(url) > 0) {
         // Initialization already owns the main queue. Start this navigation
         // before any loadURL/loadHTML calls queued immediately after creation.
         [self loadURLOnMainThread:[NSString stringWithUTF8String:url]];
@@ -3435,6 +3782,29 @@ static void schedulePendingResizeDrain() {
   }
 
   return self;
+}
+
+// Returns the parked popup when `requestId` is still waiting and this view may
+// own it. A sandboxed opener's popup can only become a sandboxed view.
+- (ElectrobunParkedPopup *)adoptParkedPopup:(uint32_t)requestId
+                                    sandbox:(bool)sandbox {
+  ElectrobunParkedPopup *popup = requestId ? g_parkedPopups[@(requestId)] : nil;
+  if (!popup || (popup.openerSandboxed && !sandbox)) {
+    return nil;
+  }
+  popup.adopting = YES;
+  if (!g_nativeRequests.respond(popup.openerWebviewId, requestId,
+                                @{@"accept" : @YES})) {
+    popup.adopting = NO;
+    return nil;
+  }
+  return popup;
+}
+
+- (BOOL)setNativeRequestHandling:(uint32_t)kinds timeoutMs:(double)timeoutMs {
+  self.nativeRequestKinds = kinds & electrobun::kAllNativeRequestKinds;
+  self.nativeRequestTimeoutMs = timeoutMs;
+  return YES;
 }
 
 - (BOOL)setSpellCheck:(BOOL)enabled {
@@ -3560,6 +3930,8 @@ static void schedulePendingResizeDrain() {
 
   // Dispatch all cleanup to main queue since WKWebView operations require it
   dispatch_async(dispatch_get_main_queue(), ^{
+    // WebKit requires every pending completion handler to be called.
+    g_nativeRequests.expireAllForWebview(webviewIdForLogging, @"closed");
     [webViewToClean stopLoading];
 
     // Remove KVO observer
@@ -8595,6 +8967,8 @@ static struct {
   bool appData;
 } g_nextWebviewAllowedProtocols = {true, false};
 
+static uint32_t g_nextWebviewPopupRequestId = 0;
+
 extern "C" void setNextWebviewFlags(bool startTransparent,
                                     bool startPassthrough) {
   g_nextWebviewFlags.startTransparent = startTransparent;
@@ -8605,6 +8979,10 @@ extern "C" void setNextWebviewAllowedProtocols(bool allowViews,
                                                bool allowAppData) {
   g_nextWebviewAllowedProtocols.views = allowViews;
   g_nextWebviewAllowedProtocols.appData = allowAppData;
+}
+
+extern "C" void setNextWebviewPopupRequest(uint32_t requestId) {
+  g_nextWebviewPopupRequestId = requestId;
 }
 
 extern "C" AbstractView *initWebview(
@@ -8625,6 +9003,8 @@ extern "C" AbstractView *initWebview(
   bool allowViewsProtocol = g_nextWebviewAllowedProtocols.views;
   bool allowAppDataProtocol = g_nextWebviewAllowedProtocols.appData;
   g_nextWebviewAllowedProtocols = {true, false};
+  uint32_t popupRequestId = g_nextWebviewPopupRequestId;
+  g_nextWebviewPopupRequestId = 0;
 
   // Validate frame values - use defaults if NaN or invalid
   if (isnan(x) || isinf(x)) {
@@ -8684,6 +9064,7 @@ extern "C" AbstractView *initWebview(
     // async)
     created.pendingStartTransparent = startTransparent;
     created.pendingStartPassthrough = startPassthrough;
+    created.pendingPopupRequestId = popupRequestId;
 
     return (__bridge void *)created;
   });
@@ -9092,6 +9473,51 @@ extern "C" bool webviewSetSpellCheck(AbstractView *abstractView, bool enabled) {
 
 extern "C" bool webviewSupportsDropSourcePaths(AbstractView *abstractView) {
   return abstractView && [abstractView supportsDropSourcePaths];
+}
+
+extern "C" bool webviewSetNativeRequestHandling(AbstractView *abstractView,
+                                               uint32_t kinds,
+                                               double timeoutMs) {
+  if (!abstractView) {
+    return false;
+  }
+  return runOnMainThreadSyncBool(^bool {
+    return [abstractView setNativeRequestHandling:kinds
+                                        timeoutMs:timeoutMs] == YES;
+  });
+}
+
+extern "C" bool webviewRespondToNativeRequest(AbstractView *abstractView,
+                                             uint32_t requestId,
+                                             const char *responseJson) {
+  if (!abstractView) {
+    return false;
+  }
+  // Parse before hopping threads: the caller's buffer is only valid now.
+  NSDictionary *response =
+      electrobun::parseNativeRequestResponse(responseJson);
+  uint32_t webviewId = abstractView.webviewId;
+  return runOnMainThreadSyncBool(^bool {
+    return g_nativeRequests.respond(webviewId, requestId, response);
+  });
+}
+
+extern "C" bool webviewCancelDownload(AbstractView *abstractView,
+                                      uint32_t downloadId) {
+  if (![abstractView isKindOfClass:[WKWebViewImpl class]]) {
+    return false;
+  }
+  return runOnMainThreadSyncBool(^bool {
+    WKWebView *webView = ((WKWebViewImpl *)abstractView).webView;
+    MyNavigationDelegate *navigationDelegate =
+        webView ? (MyNavigationDelegate *)objc_getAssociatedObject(
+                      webView, "NavigationDelegate")
+                : nil;
+    if (@available(macOS 11.3, *)) {
+      return [navigationDelegate cancelDownloadWithId:downloadId] == YES;
+    }
+    return false;
+  });
 }
 
 extern "C" void setWebviewNavigationRules(AbstractView *abstractView,

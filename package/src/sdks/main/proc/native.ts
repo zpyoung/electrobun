@@ -443,6 +443,22 @@ const core = (() => {
 				args: [FFIType.u32],
 				returns: FFIType.bool,
 			},
+			webviewSetNativeRequestHandling: {
+				args: [FFIType.u32, FFIType.u32, FFIType.f64],
+				returns: FFIType.bool,
+			},
+			webviewRespondToNativeRequest: {
+				args: [FFIType.u32, FFIType.u32, FFIType.cstring],
+				returns: FFIType.bool,
+			},
+			webviewCancelDownload: {
+				args: [FFIType.u32, FFIType.u32],
+				returns: FFIType.bool,
+			},
+			setNextWebviewPopupRequest: {
+				args: [FFIType.u32],
+				returns: FFIType.void,
+			},
 			setWebviewNavigationRules: {
 				args: [FFIType.u32, FFIType.cstring],
 				returns: FFIType.void,
@@ -2002,6 +2018,7 @@ const _ffiImpl = {
 			startTransparent: boolean;
 			startPassthrough: boolean;
 			spellCheck: boolean;
+			popupRequestId?: number;
 		}): number => {
 			const {
 				windowId,
@@ -2019,12 +2036,14 @@ const _ffiImpl = {
 				startTransparent,
 				startPassthrough,
 				spellCheck,
+				popupRequestId,
 			} = params;
 			ensureWebviewRuntimeConfigured();
 			core_.symbols.setNextWebviewAllowedProtocols(
 				allowedProtocols.views,
 				allowedProtocols.appData,
 			);
+			core_.symbols.setNextWebviewPopupRequest(popupRequestId ?? 0);
 
 			const webviewId = core_.symbols.createWebview(
 				windowId,
@@ -2131,6 +2150,37 @@ const _ffiImpl = {
 		},
 		webviewSupportsLoadFailed: (params: { id: number }) => {
 			return core_.symbols.webviewSupportsLoadFailed(params.id);
+		},
+		webviewSetNativeRequestHandling: (params: {
+			id: number;
+			kinds: number;
+			timeoutMs: number;
+		}): boolean => {
+			return core_.symbols.webviewSetNativeRequestHandling(
+				params.id,
+				params.kinds,
+				params.timeoutMs,
+			);
+		},
+		webviewRespondToNativeRequest: (params: {
+			id: number;
+			requestId: number;
+			responseJson: string;
+		}): boolean => {
+			return core_.symbols.webviewRespondToNativeRequest(
+				params.id,
+				params.requestId,
+				toCString(params.responseJson),
+			);
+		},
+		webviewCancelDownload: (params: {
+			id: number;
+			downloadId: number;
+		}): boolean => {
+			return core_.symbols.webviewCancelDownload(
+				params.id,
+				params.downloadId,
+			);
 		},
 		setWebviewNavigationRules: (params: { id: number; rulesJson: string }) => {
 			core_.symbols.setWebviewNavigationRules(params.id, toCString(params.rulesJson));
@@ -3476,6 +3526,17 @@ const webviewDecideNavigation = new JSCallback(
 	},
 );
 
+const nativeRequestEventNames = new Set([
+	"dialog-request",
+	"auth-request",
+	"certificate-request",
+	"download-request",
+	"popup-request",
+	"external-app-request",
+	"native-request-expired",
+	"close-requested",
+]);
+
 const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 	BrowserView.ensureWrapped(id);
 
@@ -3498,6 +3559,14 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		"download-completed": "downloadCompleted",
 		"download-failed": "downloadFailed",
 		"drop-source-paths": "dropSourcePaths",
+		"dialog-request": "dialogRequest",
+		"auth-request": "authRequest",
+		"certificate-request": "certificateRequest",
+		"download-request": "downloadRequest",
+		"popup-request": "popupRequest",
+		"external-app-request": "externalAppRequest",
+		"native-request-expired": "nativeRequestExpired",
+		"close-requested": "closeRequested",
 		"load-started": "loadStarted",
 		"load-committed": "loadCommitted",
 		"load-finished": "loadFinished",
@@ -3531,6 +3600,7 @@ const webviewEventHandler = (id: number, eventName: string, detail: string) => {
 		eventName === "download-progress" ||
 		eventName === "download-completed" ||
 		eventName === "download-failed" ||
+		nativeRequestEventNames.has(eventName) ||
 		eventName === "drop-source-paths" ||
 		eventName === "load-failed"
 	) {

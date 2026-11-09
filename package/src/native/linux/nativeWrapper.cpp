@@ -8048,6 +8048,11 @@ ELECTROBUN_EXPORT void setNextWebviewAllowedProtocols(bool allowViews, bool allo
     g_nextAllowedProtocols = {allowViews, allowAppData};
 }
 
+ELECTROBUN_EXPORT void setNextWebviewPopupRequest(uint32_t requestId) {
+    // Popup requests are never issued here, so there is nothing to adopt.
+    (void)requestId;
+}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          void* window,
                          const char* renderer,
@@ -9728,6 +9733,27 @@ ELECTROBUN_EXPORT bool webviewSetSpellCheck(AbstractView* abstractView, bool ena
 ELECTROBUN_EXPORT bool webviewSupportsDropSourcePaths(AbstractView* abstractView) {
     (void)abstractView;
     // Dropped-file source paths are only wired for macOS WKWebView, not WebKitGTK or CEF.
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewSetNativeRequestHandling(AbstractView* abstractView, uint32_t kinds, double timeoutMs) {
+    (void)abstractView;
+    (void)kinds;
+    (void)timeoutMs;
+    // Native page requests are implemented for macOS WKWebView, not WebKitGTK or CEF.
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewRespondToNativeRequest(AbstractView* abstractView, uint32_t requestId, const char* responseJson) {
+    (void)abstractView;
+    (void)requestId;
+    (void)responseJson;
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewCancelDownload(AbstractView* abstractView, uint32_t downloadId) {
+    (void)abstractView;
+    (void)downloadId;
     return false;
 }
 

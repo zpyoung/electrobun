@@ -3484,6 +3484,17 @@ export fn webviewSetSpellCheck(webview_id: u32, enabled: bool) bool {
     return webview_set_spell_check(webview, enabled);
 }
 
+export fn webviewSupportsDropSourcePaths(webview_id: u32) bool {
+    clearLastError();
+    const WebviewSupportsDropSourcePathsFn = *const fn (WebviewPtr) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const webview_supports_drop_source_paths = lookupNativeSymbol(
+        WebviewSupportsDropSourcePathsFn,
+        "webviewSupportsDropSourcePaths",
+    ) orelse return false;
+    return webview_supports_drop_source_paths(webview);
+}
+
 export fn setWebviewNavigationRules(webview_id: u32, rules_json: [*:0]const u8) void {
     clearLastError();
     const SetWebviewNavigationRulesFn = *const fn (WebviewPtr, [*:0]const u8) callconv(.c) void;

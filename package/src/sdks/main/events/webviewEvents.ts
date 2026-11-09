@@ -13,6 +13,8 @@ type NewWindowOpenData = {
 		  };
 };
 
+type DropSourcePathsData = { detail: { paths: string[] } };
+
 export default {
 	willNavigate: (data: DetailData) =>
 		new ElectrobunEvent<DetailData, {}>("will-navigate", data),
@@ -36,4 +38,6 @@ export default {
 		new ElectrobunEvent<DetailData, {}>("download-completed", data),
 	downloadFailed: (data: DetailData) =>
 		new ElectrobunEvent<DetailData, {}>("download-failed", data),
+	dropSourcePaths: (data: DropSourcePathsData) =>
+		new ElectrobunEvent<DropSourcePathsData, {}>("drop-source-paths", data),
 };

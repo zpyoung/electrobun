@@ -29,6 +29,19 @@ describe("parseWebviewEventBridgeMessage", () => {
 		).toBeNull();
 	});
 
+	it("rejects events only the native wrapper may report", () => {
+		const forged = JSON.stringify({
+			id: "webviewEvent",
+			type: "message",
+			payload: {
+				id: 4,
+				eventName: "drop-source-paths",
+				detail: '{"paths":["/etc/passwd"]}',
+			},
+		});
+		expect(parseWebviewEventBridgeMessage(4, forged)).toBeNull();
+	});
+
 	it("keeps hostile detail as inert string data", () => {
 		const detail = 'null); globalThis.pwned = "yes"; //';
 		expect(parseWebviewEventBridgeMessage(4, eventMessage(4, detail))).toEqual({

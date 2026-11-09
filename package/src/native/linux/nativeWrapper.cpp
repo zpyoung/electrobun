@@ -9702,6 +9702,22 @@ void webviewSetHidden(AbstractView* abstractView, bool hidden) {
     }
 }
 
+ELECTROBUN_EXPORT bool webviewReloadIgnoringCache(AbstractView* abstractView) {
+    (void)abstractView;
+    // Cache-bypassing reload and load-failed events target macOS WKWebView, not WebKitGTK or CEF.
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewSupportsReloadIgnoringCache(AbstractView* abstractView) {
+    (void)abstractView;
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewSupportsLoadFailed(AbstractView* abstractView) {
+    (void)abstractView;
+    return false;
+}
+
 ELECTROBUN_EXPORT bool webviewSetSpellCheck(AbstractView* abstractView, bool enabled) {
     (void)abstractView;
     (void)enabled;

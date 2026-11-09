@@ -14,7 +14,8 @@ type WebviewEventTypes =
 	| "download-failed"
 	| "load-started"
 	| "load-committed"
-	| "load-finished";
+	| "load-finished"
+	| "load-failed";
 
 /**
  * Interface representing an <electrobun-webview> custom element.
@@ -51,6 +52,9 @@ interface WebviewTagElement extends HTMLElement {
 	goBack(): void;
 	goForward(): void;
 	reload(): void;
+	reloadIgnoringCache(): Promise<boolean>;
+	supportsReloadIgnoringCache(): Promise<boolean>;
+	supportsLoadFailed(): Promise<boolean>;
 	loadURL(url: string): void;
 	loadHTML(html: string): void;
 	setSpellCheck(enabled: boolean): Promise<boolean>;

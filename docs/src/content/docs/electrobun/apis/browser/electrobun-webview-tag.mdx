@@ -113,6 +113,40 @@ webview.setNavigationRules([
 
 An empty rules array restores the default allow behavior.
 
+## Reload Ignoring The Cache And Load Failures
+
+`reloadIgnoringCache()` reloads the current page and asks every cache,
+including the renderer's own, to bypass its copy. The URL and the view's
+partition stay the same. `load-failed` fires when a navigation fails before
+or after it commits, for example on a DNS, connection or TLS error.
+
+```typescript
+import "electrobun/view";
+
+const webview = document.querySelector("electrobun-webview");
+if (!webview) throw new Error("The embedded webview was not found");
+
+if (await webview.supportsReloadIgnoringCache()) {
+  await webview.reloadIgnoringCache();
+}
+
+webview.on("load-failed", (event: CustomEvent) => {
+  const { url, domain, code, description } = event.detail;
+  console.log(`Could not load ${url}: ${description} (${domain} ${code})`);
+});
+console.log({ reportsLoadFailures: await webview.supportsLoadFailed() });
+```
+
+The `load-failed` detail carries the failing `url`, the native error `domain`
+and `code`, and a localized `description`. Depending on the WebKit version, a
+navigation that is stopped or replaced by a newer one may report
+`NSURLErrorDomain` code `-999`, so compare `url` with the navigation you
+started before showing an error.
+
+Native WKWebView on macOS supports both. Other renderers return `false` from
+`supportsReloadIgnoringCache()` and `supportsLoadFailed()`, and
+`reloadIgnoringCache()` resolves to `false` without reloading.
+
 ## Visibility And Input
 
 The toggle methods accept an explicit state. Omit it to invert the current
@@ -245,6 +279,7 @@ Supported event names are:
 - `load-started`
 - `load-committed`
 - `load-finished`
+- `load-failed`
 
 Embedded content can emit a `host-message` from its preload script:
 

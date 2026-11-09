@@ -23,7 +23,8 @@ type WebviewEventType =
 	| "download-failed"
 	| "load-started"
 	| "load-committed"
-	| "load-finished";
+	| "load-finished"
+	| "load-failed";
 
 // Registry for webview instances (for event routing from bun)
 export const webviewRegistry: Record<number, ElectrobunWebviewTag> = {};
@@ -309,6 +310,28 @@ export class ElectrobunWebviewTag extends HTMLElement {
 		return (await request("webviewTagSetSpellCheck", {
 			id: this.webviewId,
 			enabled,
+		})) as boolean;
+	}
+
+	/** Returns false, without reloading, when the renderer cannot bypass the cache. */
+	async reloadIgnoringCache(): Promise<boolean> {
+		if (this.webviewId === null) return false;
+		return (await request("webviewTagReloadIgnoringCache", {
+			id: this.webviewId,
+		})) as boolean;
+	}
+
+	async supportsReloadIgnoringCache(): Promise<boolean> {
+		if (this.webviewId === null) return false;
+		return (await request("webviewTagSupportsReloadIgnoringCache", {
+			id: this.webviewId,
+		})) as boolean;
+	}
+
+	async supportsLoadFailed(): Promise<boolean> {
+		if (this.webviewId === null) return false;
+		return (await request("webviewTagSupportsLoadFailed", {
+			id: this.webviewId,
 		})) as boolean;
 	}
 

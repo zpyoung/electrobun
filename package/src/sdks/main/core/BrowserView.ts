@@ -466,6 +466,16 @@ export class BrowserView<T extends RPCWithTransport = RPCWithTransport> {
 		return ffi.request.webviewGetPageZoom({ id: this.id }) as number;
 	}
 
+	/**
+	 * The UUID of the native data store this webview was created with, for
+	 * checking which store a partition really uses.
+	 * @returns null for CEF views, non-persistent partitions, macOS before 14,
+	 * Linux and Windows
+	 */
+	getStorageIdentifier(): string | null {
+		return ffi.request.webviewGetStorageIdentifier({ id: this.id });
+	}
+
 	// todo (yoav): move this to a class that also has off, append, prepend, etc.
 	// name should only allow browserView events
 	// Note: normalize event names to willNavigate instead of ['will-navigate'] to save

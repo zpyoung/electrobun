@@ -92,6 +92,7 @@ export default {
 		"test:macos-drop-source-paths": "scripts/test-macos-drop-source-paths.sh",
 		"test:native-requests": "node --test src/shared/native-requests.test.js",
 		"test:macos-native-requests": "scripts/test-macos-native-requests.sh",
+		"test:macos-website-data-store": "scripts/test-macos-website-data-store.sh",
 		"bump-cef": "hutch scripts/update-cef-version.ts",
 	},
 };

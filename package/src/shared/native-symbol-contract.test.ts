@@ -346,3 +346,50 @@ describe("SDK to ElectrobunCore ABI", () => {
 		},
 	);
 });
+
+describe("Session storage status ABI", () => {
+	const statusReturningSymbols = [
+		"sessionClearStorageData",
+		"sessionSetStorageIdentifier",
+	];
+
+	test.each(statusReturningSymbols)("%s returns an int32 status everywhere", (symbol) => {
+		expect(typescriptNativeTable).toMatch(
+			new RegExp(`${symbol}: \\{[^}]*returns: FFIType\\.i32,`),
+		);
+		expect(sources.core).toMatch(
+			new RegExp(`export fn ${symbol}\\([^)]*\\) i32 \\{`),
+		);
+		for (const wrapper of Object.values(sources.wrappers)) {
+			expect(wrapper).toMatch(
+				new RegExp(`int32_t ${symbol}\\s*\\(`),
+			);
+		}
+	});
+
+	test.each(["linux", "win32"] as const)(
+		"%s reports storage completion and identifiers unsupported",
+		(platform) => {
+			const wrapper = sources.wrappers[platform];
+			const clear = sourceSection(
+				wrapper,
+				"int32_t sessionClearStorageData(",
+				"int32_t sessionSetStorageIdentifier(",
+				`${platform} storage clear`,
+			);
+			expect(clear).toContain(
+				"return electrobun::StorageClearUnsupportedPlatform;",
+			);
+			expect(clear).not.toMatch(/return\s+electrobun::StorageClearCleared/);
+			expect(wrapper).toContain(
+				"return electrobun::StorageIdentifierUnsupportedPlatform;",
+			);
+		},
+	);
+
+	test("reads a webview's store identifier through ElectrobunCore", () => {
+		expect(eagerCoreDemands.typescript).toContain("webviewGetStorageIdentifier");
+		expect(coreExports).toContain("webviewGetStorageIdentifier");
+		expect(coreLazyWrapperSymbols).toContain("webviewGetStorageIdentifier");
+	});
+});

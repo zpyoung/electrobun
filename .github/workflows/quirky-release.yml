@@ -1,0 +1,52 @@
+name: quirky-release
+
+on:
+  push:
+    tags:
+      - 'v*-quirky.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the release version
+        run: quirky/bin/check-version "$GITHUB_REF_NAME"
+
+      - name: Check the runner is native arm64
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1
+
+      - name: Install Hutch
+        uses: ./.github/actions/install-hutch
+
+      - name: Install dependencies
+        working-directory: package
+        run: hutch run install
+
+      - name: Build the devkit
+        working-directory: package
+        run: node scripts/package-release.js
+
+      - name: Run every patch test
+        run: quirky/bin/run-patch-tests
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=package/electrobun-core-darwin-arm64.tar.gz
+          shasum -a 256 "$asset" | sed 's|package/||' > "$asset.sha256"
+          {
+            echo "Quirky's Electrobun ${GITHUB_REF_NAME#v}: upstream $(sed -n 's/^# base //p' quirky/patches.txt) plus these patches, in order:"
+            echo
+            awk '!/^[[:space:]]*(#|$)/ { print "- `" $1 "`" }' quirky/patches.txt
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$asset" "$asset.sha256" \
+            --title "${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag

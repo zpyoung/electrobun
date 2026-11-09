@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run every listed patch's test from the root of the unified build, and fail if any fails.
+# In the unified build this lives at quirky/bin/ next to quirky/patches.txt.
+set -uo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+patches="$root/quirky/patches.txt"
+[ -f "$patches" ] || { echo "error: $patches not found" >&2; exit 1; }
+
+failed=()
+count=0
+while IFS=$'\t' read -r branch test; do
+  count=$((count + 1))
+  echo "::group::$branch"
+  if [ -z "$test" ]; then
+    echo "error: $branch has no test command" >&2
+    failed+=("$branch")
+  elif ! (cd "$root" && bash -c "$test"); then
+    failed+=("$branch")
+  fi
+  echo "::endgroup::"
+done < <(awk '!/^[[:space:]]*(#|$)/ { b = $1; $1 = ""; sub(/^[[:space:]]+/, ""); print b "\t" $0 }' "$patches")
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  printf 'patch test failed: %s\n' "${failed[@]}" >&2
+  exit 1
+fi
+echo "$count patch tests passed"

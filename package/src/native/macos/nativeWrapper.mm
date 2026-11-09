@@ -35,6 +35,7 @@ static bool wgpuDebugEnabled() {
 #include "isolated_preview.h"
 #include "spell_check.h"
 #include "website_data_store.h"
+#include "user_agent.h"
 #import <UserNotifications/UserNotifications.h>
 #include <atomic>
 #include <mutex>
@@ -1132,6 +1133,7 @@ void releaseObjCObject(id objcObject) {
                                  status:(NSInteger)status
                                 headers:(NSDictionary *)headers
                                    body:(NSData *)body;
+- (BOOL)setUserAgent:(NSString *)userAgent;
 
 - (BOOL)canGoBack;
 - (BOOL)canGoForward;
@@ -1269,6 +1271,7 @@ static uint32_t g_nextDownloadId = 1;
     ElectrobunIsolatedPreviewSchemeHandler *isolatedPreviewSchemeHandler;
 @property(nonatomic, assign) BOOL isolatedPreviewReady;
 @property(nonatomic, copy) NSString *pendingIsolatedPreviewURL;
+@property(nonatomic, copy) NSString *pendingUserAgent;
 
 - (void)loadURLOnMainThread:(NSString *)urlString;
 
@@ -1749,6 +1752,11 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
                                  status:(NSInteger)status
                                 headers:(NSDictionary *)headers
                                    body:(NSData *)body {
+  return NO;
+}
+
+- (BOOL)setUserAgent:(NSString *)userAgent {
+  (void)userAgent;
   return NO;
 }
 
@@ -3709,6 +3717,10 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
         };
         self.webView = webView;
       }
+      if (self.pendingUserAgent) {
+        electrobun::setCustomUserAgent(self.webView, self.pendingUserAgent);
+        self.pendingUserAgent = nil;
+      }
 
       // Only set transparent background for main window webviews
       // (autoResize/fullscreen) Child webviews (OOPIFs) need a visible
@@ -3968,6 +3980,15 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
   if (navigationDelegate.hasFinishedNavigation) {
     return electrobun::setContinuousSpellChecking(self.webView, enabled);
   }
+  return YES;
+}
+
+- (BOOL)setUserAgent:(NSString *)userAgent {
+  if (!self.webView) {
+    self.pendingUserAgent = userAgent ?: @"";
+    return YES;
+  }
+  electrobun::setCustomUserAgent(self.webView, userAgent);
   return YES;
 }
 
@@ -9788,6 +9809,40 @@ extern "C" bool webviewCancelDownload(AbstractView *abstractView,
     }
     return false;
   });
+}
+
+extern "C" bool webviewSetUserAgent(AbstractView *abstractView,
+                                    const char *userAgent) {
+  if (!abstractView) {
+    return false;
+  }
+  NSString *userAgentString =
+      userAgent ? [NSString stringWithUTF8String:userAgent] : nil;
+  return runOnMainThreadSyncBool(^bool {
+    return [abstractView setUserAgent:userAgentString] == YES;
+  });
+}
+
+// Returns a caller-owned copy, or NULL if WebKit didn't answer in time.
+extern "C" const char *getDefaultUserAgent() {
+  static NSString *cachedUserAgent = nil;
+  __block NSString *userAgent = nil;
+  waitForMainThreadAsyncCompletion(
+      5 * NSEC_PER_SEC, ^(dispatch_semaphore_t completionSemaphore) {
+        if (cachedUserAgent) {
+          userAgent = cachedUserAgent;
+          dispatch_semaphore_signal(completionSemaphore);
+          return;
+        }
+        __block WKWebView *probe = electrobun::createDefaultUserAgentProbe();
+        electrobun::readUserAgent(probe, ^(NSString *result) {
+          cachedUserAgent = result;
+          userAgent = result;
+          probe = nil;
+          dispatch_semaphore_signal(completionSemaphore);
+        });
+      });
+  return userAgent ? strdup(userAgent.UTF8String) : nullptr;
 }
 
 extern "C" void setWebviewNavigationRules(AbstractView *abstractView,

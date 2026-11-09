@@ -3657,6 +3657,27 @@ export fn webviewCancelDownload(webview_id: u32, download_id: u32) bool {
     return cancel_download(webview, download_id);
 }
 
+export fn webviewSetUserAgent(webview_id: u32, user_agent: [*:0]const u8) bool {
+    clearLastError();
+    const WebviewSetUserAgentFn = *const fn (WebviewPtr, [*:0]const u8) callconv(.c) bool;
+    const webview = requireWebviewPtr(webview_id) orelse return false;
+    const webview_set_user_agent = lookupNativeSymbol(
+        WebviewSetUserAgentFn,
+        "webviewSetUserAgent",
+    ) orelse return false;
+    return webview_set_user_agent(webview, user_agent);
+}
+
+export fn getDefaultUserAgent() ?[*:0]const u8 {
+    clearLastError();
+    const GetDefaultUserAgentFn = *const fn () callconv(.c) ?[*:0]const u8;
+    const get_default_user_agent = lookupNativeSymbol(
+        GetDefaultUserAgentFn,
+        "getDefaultUserAgent",
+    ) orelse return null;
+    return get_default_user_agent();
+}
+
 export fn setWebviewNavigationRules(webview_id: u32, rules_json: [*:0]const u8) void {
     clearLastError();
     const SetWebviewNavigationRulesFn = *const fn (WebviewPtr, [*:0]const u8) callconv(.c) void;

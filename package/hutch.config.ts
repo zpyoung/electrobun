@@ -71,6 +71,7 @@ export default {
 		"test:macos-inspector-layout": "scripts/test-macos-inspector-layout.sh",
 		"test:user-agent": "node --test src/shared/user-agent.test.js",
 		"test:macos-user-agent": "scripts/test-macos-user-agent.sh",
+		"test:macos-notification-response": "scripts/test-macos-notification-response.sh",
 		"test:templates": ["hutch", "scripts/check-release.ts", "templates"],
 		"test:odin-templates": "node scripts/test-odin-templates.mjs",
 		"test:template-publisher": "node --test ../scripts/publish-templates.test.mjs",

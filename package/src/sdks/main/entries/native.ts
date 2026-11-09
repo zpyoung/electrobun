@@ -12,5 +12,6 @@ export type {
 	MenuItemConfig,
 	Point,
 	Rectangle,
+	SessionProxy,
 	StorageType,
 } from "../proc/native";

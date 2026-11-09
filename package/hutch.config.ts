@@ -98,6 +98,7 @@ export default {
 		"test:macos-website-data-store": "scripts/test-macos-website-data-store.sh",
 		"test:isolated-preview": "node --test src/shared/isolated-preview.test.js",
 		"test:macos-isolated-preview": "scripts/test-macos-isolated-preview.sh",
+		"test:macos-frame-navigation-rules": "scripts/test-macos-frame-navigation-rules.sh",
 		"bump-cef": "hutch scripts/update-cef-version.ts",
 	},
 };

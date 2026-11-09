@@ -252,6 +252,26 @@ While Linux CEF creates its browser, it retains the latest `loadURL()` or
 On macOS, WKWebView uses file-URL loading for local files. `getPageZoom()` reads
 on the main thread after pending initialization and zoom changes.
 
+`setNavigationRules(rules)` checks every navigation in native code. `*` is a
+wildcard, `^` marks a blocking rule, the last matching rule wins, and with no
+matching rule navigation is allowed. A rule written as `frame:<pattern>` or
+`^frame:<pattern>` applies only to iframe navigations, so a page can render a
+`srcdoc`, `data:` or `blob:` iframe while top-level navigation stays strict:
+
+```ts
+view.setNavigationRules([
+  "^*",
+  "https://*",
+  "frame:about:srcdoc",
+  "frame:data:*",
+  "frame:blob:*",
+]);
+```
+
+Frame rules apply on macOS, with both WKWebView and CEF. On Linux and Windows
+every navigation is checked as top-level, so frame rules never match there and
+the policy is as strict as the rules without them.
+
 ## Session proxies
 
 `Session.fromPartition(partition).setProxy()` sends every request from views

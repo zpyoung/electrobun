@@ -190,6 +190,11 @@ jobs:
         run: hutch test:macos-user-agent
         working-directory: package
 
+      - name: Exercise macOS frame navigation rules
+        if: matrix.platform == 'darwin'
+        run: hutch test:macos-frame-navigation-rules
+        working-directory: package
+
       - name: Setup MSVC Developer Command Prompt
         if: matrix.platform == 'win32'
         uses: ilammy/msvc-dev-cmd@v1

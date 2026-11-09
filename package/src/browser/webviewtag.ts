@@ -73,6 +73,11 @@ interface WebviewTagElement extends HTMLElement {
 	syncDimensions(force?: boolean): void;
 
 	// Navigation rules
+	/**
+	 * Sets the native navigation policy. `*` is a wildcard, `^` blocks, the last
+	 * matching rule wins and no match allows. A `frame:` or `^frame:` rule applies
+	 * only to iframe navigations (macOS only; it never matches elsewhere).
+	 */
 	setNavigationRules(rules: string[]): void;
 
 	// Find in page

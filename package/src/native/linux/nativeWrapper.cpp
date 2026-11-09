@@ -8054,6 +8054,32 @@ ELECTROBUN_EXPORT void setNextWebviewPopupRequest(uint32_t requestId) {
     (void)requestId;
 }
 
+// Isolated preview views rely on WKWebView content rules, Lockdown Mode and
+// URL scheme handlers; this platform reports them unsupported.
+ELECTROBUN_EXPORT bool isolatedPreviewSupported() {
+    return false;
+}
+
+ELECTROBUN_EXPORT bool setNextWebviewIsolatedPreview(const char* scheme) {
+    (void)scheme;
+    return false;
+}
+
+ELECTROBUN_EXPORT bool webviewIsolatedPreviewRespond(AbstractView* abstractView,
+                                                     uint32_t requestId,
+                                                     uint32_t status,
+                                                     const char* headersJson,
+                                                     const uint8_t* body,
+                                                     size_t bodyLength) {
+    (void)abstractView;
+    (void)requestId;
+    (void)status;
+    (void)headersJson;
+    (void)body;
+    (void)bodyLength;
+    return false;
+}
+
 ELECTROBUN_EXPORT AbstractView* initWebview(uint32_t webviewId,
                          void* window,
                          const char* renderer,

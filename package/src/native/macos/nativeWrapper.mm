@@ -32,6 +32,7 @@ static bool wgpuDebugEnabled() {
 #include "inspector_layout.h"
 #include "load_failed.h"
 #include "native_requests.h"
+#include "isolated_preview.h"
 #include "spell_check.h"
 #include "website_data_store.h"
 #import <UserNotifications/UserNotifications.h>
@@ -1101,6 +1102,8 @@ void releaseObjCObject(id objcObject) {
 @property(nonatomic, assign) uint32_t pendingPopupRequestId;
 @property(nonatomic, assign) uint32_t nativeRequestKinds;
 @property(nonatomic, assign) double nativeRequestTimeoutMs;
+// Set before the deferred creation block runs; nil for an ordinary webview.
+@property(nonatomic, copy) NSString *isolatedPreviewScheme;
 @property(nonatomic, strong) CALayer *storedLayerMask;
 @property(nonatomic, strong) NSArray<NSString *> *navigationRules;
 @property(atomic, assign) uint32_t resizeGeneration;
@@ -1125,6 +1128,10 @@ void releaseObjCObject(id objcObject) {
 - (BOOL)setSpellCheck:(BOOL)enabled;
 - (BOOL)supportsDropSourcePaths;
 - (BOOL)setNativeRequestHandling:(uint32_t)kinds timeoutMs:(double)timeoutMs;
+- (BOOL)respondToIsolatedPreviewRequest:(uint32_t)requestId
+                                 status:(NSInteger)status
+                                headers:(NSDictionary *)headers
+                                   body:(NSData *)body;
 
 - (BOOL)canGoBack;
 - (BOOL)canGoForward;
@@ -1230,11 +1237,14 @@ static uint32_t g_nextDownloadId = 1;
 @property(nonatomic, assign) BOOL spellCheckEnabled;
 @property(nonatomic, assign) BOOL hasFinishedNavigation;
 - (BOOL)cancelDownloadWithId:(uint32_t)downloadId API_AVAILABLE(macos(11.3));
+@property(nonatomic, copy) NSString *isolatedPreviewScheme;
+@property(nonatomic, assign) BOOL isolatedPreviewReady;
 @end
 
 @interface MyWebViewUIDelegate : NSObject <WKUIDelegate>
 @property(nonatomic, assign) WebviewEventHandler zigEventHandler;
 @property(nonatomic, assign) uint32_t webviewId;
+@property(nonatomic, assign) BOOL isolatedPreview;
 @end
 
 @interface MyScriptMessageHandler : NSObject <WKScriptMessageHandler>
@@ -1255,6 +1265,10 @@ static uint32_t g_nextDownloadId = 1;
 // ----------------------- Webview Implementations -----------------------
 @interface WKWebViewImpl : AbstractView
 @property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, strong)
+    ElectrobunIsolatedPreviewSchemeHandler *isolatedPreviewSchemeHandler;
+@property(nonatomic, assign) BOOL isolatedPreviewReady;
+@property(nonatomic, copy) NSString *pendingIsolatedPreviewURL;
 
 - (void)loadURLOnMainThread:(NSString *)urlString;
 
@@ -1728,6 +1742,13 @@ NSArray<NSValue *> *addOverlapRects(NSArray<NSDictionary *> *rectsArray,
 - (BOOL)setNativeRequestHandling:(uint32_t)kinds timeoutMs:(double)timeoutMs {
   (void)kinds;
   (void)timeoutMs;
+  return NO;
+}
+
+- (BOOL)respondToIsolatedPreviewRequest:(uint32_t)requestId
+                                 status:(NSInteger)status
+                                headers:(NSDictionary *)headers
+                                   body:(NSData *)body {
   return NO;
 }
 
@@ -2720,6 +2741,28 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
                         (void (^)(WKNavigationActionPolicy))decisionHandler {
   NSURL *newURL = navigationAction.request.URL;
 
+  if (self.isolatedPreviewScheme) {
+    // Nothing navigates before the content rules are installed, and nothing
+    // leaves the preview scheme, even as a cmd-click or a download.
+    AbstractView *previewView =
+        [globalAbstractViews objectForKey:@(self.webviewId)];
+    BOOL allowed =
+        self.isolatedPreviewReady &&
+        electrobun::isolatedPreviewNavigationActionPolicy(
+            navigationAction, self.isolatedPreviewScheme) ==
+            WKNavigationActionPolicyAllow &&
+        (!previewView ||
+         [previewView shouldAllowNavigationToURL:newURL.absoluteString]);
+    NSString *eventData = [NSString
+        stringWithFormat:@"{\"url\":\"%@\",\"allowed\":%@}",
+                         newURL.absoluteString, allowed ? @"true" : @"false"];
+    self.zigEventHandler(self.webviewId, strdup("will-navigate"),
+                         strdup([eventData UTF8String]));
+    decisionHandler(allowed ? WKNavigationActionPolicyAllow
+                            : WKNavigationActionPolicyCancel);
+    return;
+  }
+
   // Check if cmd key is held - if so, fire event and block navigation
   BOOL isCmdClick =
       (navigationAction.modifierFlags & NSEventModifierFlagCommand) != 0;
@@ -2789,6 +2832,12 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
     decidePolicyForNavigationResponse:(WKNavigationResponse *)navigationResponse
                       decisionHandler:(void (^)(WKNavigationResponsePolicy))
                                           decisionHandler {
+  if (self.isolatedPreviewScheme) {
+    decisionHandler(
+        electrobun::isolatedPreviewNavigationResponsePolicy(navigationResponse));
+    return;
+  }
+
   // If the response cannot be shown (e.g., binary file, attachment), trigger
   // download
   if (!navigationResponse.canShowMIMEType) {
@@ -2916,6 +2965,10 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
 - (void)webView:(WKWebView *)webView
      navigationAction:(WKNavigationAction *)navigationAction
     didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+  if (self.isolatedPreviewScheme) {
+    [download cancel:nil];
+    return;
+  }
   NSLog(@"DEBUG WKWebView Download: Navigation action became download");
   [self trackDownload:download];
 }
@@ -2924,6 +2977,10 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
 - (void)webView:(WKWebView *)webView
     navigationResponse:(WKNavigationResponse *)navigationResponse
      didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+  if (self.isolatedPreviewScheme) {
+    [download cancel:nil];
+    return;
+  }
   NSLog(@"DEBUG WKWebView Download: Navigation response became download");
   [self trackDownload:download];
 }
@@ -3132,6 +3189,11 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
     createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration
                forNavigationAction:(WKNavigationAction *)navigationAction
                     windowFeatures:(WKWindowFeatures *)windowFeatures {
+  // A preview's popup is the document asking, not the user, so it is dropped
+  // without a new-window-open event an app might act on.
+  if (self.isolatedPreview) {
+    return nil;
+  }
 
   // Check if this is a cmd+click or a traditional popup window request
   BOOL isCmdClick =
@@ -3276,6 +3338,10 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
               initiatedByFrame:(WKFrameInfo *)frame
              completionHandler:
                  (void (^)(NSArray<NSURL *> *_Nullable URLs))completionHandler {
+  if (self.isolatedPreview) {
+    completionHandler(nil);
+    return;
+  }
 
   NSOpenPanel *openPanel = [NSOpenPanel openPanel];
 
@@ -3312,6 +3378,11 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
 
   NSLog(@"WKWebView: Media capture permission requested for %@ (type: %ld)",
         originString, (long)type);
+
+  if (self.isolatedPreview) {
+    decisionHandler(WKPermissionDecisionDeny);
+    return;
+  }
 
   // views:// is the app's own bundled-asset shell — always trusted, never
   // prompt.
@@ -3406,6 +3477,11 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
   std::string originStd = [originString UTF8String];
 
   NSLog(@"WKWebView: Geolocation permission requested for %@", originString);
+
+  if (self.isolatedPreview) {
+    decisionHandler(WKPermissionDecisionDeny);
+    return;
+  }
 
   // views:// is the app's own bundled-asset shell — always trusted, never
   // prompt.
@@ -3552,8 +3628,14 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
       WKWebViewConfiguration *configuration =
           [[WKWebViewConfiguration alloc] init];
 
-      configuration.websiteDataStore =
-          createDataStoreForPartition([partitionString UTF8String]);
+      NSString *isolatedPreviewScheme = self.isolatedPreviewScheme;
+      BOOL sandboxed = sandbox || isolatedPreviewScheme != nil;
+      self.isSandboxed = sandboxed;
+
+      if (!isolatedPreviewScheme) {
+        configuration.websiteDataStore =
+            createDataStoreForPartition([partitionString UTF8String]);
+      }
 
       [configuration.preferences setValue:@YES
                                    forKey:@"developerExtrasEnabled"];
@@ -3563,19 +3645,51 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
           setValue:@YES
             forKey:@"allowsPictureInPictureMediaPlayback"];
 
-      // Add scheme handler
-      MyURLSchemeHandler *assetSchemeHandler =
-          [[MyURLSchemeHandler alloc] init];
-      // TODO: Consider storing views handler globally and not on each
-      // AbstractView
-      assetSchemeHandler.webviewId = webviewId;
-      assetSchemeHandler.viewsRoot = viewsRootString;
-      assetSchemeHandler.allowViews = allowViewsProtocol;
-      assetSchemeHandler.allowAppData = allowAppDataProtocol;
-      [configuration setURLSchemeHandler:assetSchemeHandler
-                            forURLScheme:@"views"];
-      [configuration setURLSchemeHandler:assetSchemeHandler
-                            forURLScheme:@"appdata"];
+      if (isolatedPreviewScheme) {
+        // The preview never gets views:// or appdata://; its only document
+        // source is the app's handler for its own scheme.
+        self.isolatedPreviewSchemeHandler =
+            [[ElectrobunIsolatedPreviewSchemeHandler alloc]
+                initWithRequestHandler:^(uint32_t requestId,
+                                         NSURLRequest *request, NSData *body) {
+                  NSMutableDictionary *detail = [@{
+                    @"requestId" : @(requestId),
+                    @"url" : request.URL.absoluteString ?: @"",
+                    @"method" : request.HTTPMethod ?: @"GET",
+                    @"headers" : request.allHTTPHeaderFields ?: @{},
+                  } mutableCopy];
+                  if (body.length > 0) {
+                    detail[@"body"] = [body base64EncodedStringWithOptions:0];
+                  }
+                  NSData *jsonData =
+                      [NSJSONSerialization dataWithJSONObject:detail
+                                                      options:0
+                                                        error:nil];
+                  NSString *eventData =
+                      [[NSString alloc] initWithData:jsonData
+                                            encoding:NSUTF8StringEncoding];
+                  webviewEventHandler(webviewId,
+                                      strdup("isolated-preview-request"),
+                                      strdup([eventData UTF8String]));
+                }];
+        electrobun::configureIsolatedPreview(configuration,
+                                             isolatedPreviewScheme,
+                                             self.isolatedPreviewSchemeHandler);
+      } else {
+        // Add scheme handler
+        MyURLSchemeHandler *assetSchemeHandler =
+            [[MyURLSchemeHandler alloc] init];
+        // TODO: Consider storing views handler globally and not on each
+        // AbstractView
+        assetSchemeHandler.webviewId = webviewId;
+        assetSchemeHandler.viewsRoot = viewsRootString;
+        assetSchemeHandler.allowViews = allowViewsProtocol;
+        assetSchemeHandler.allowAppData = allowAppDataProtocol;
+        [configuration setURLSchemeHandler:assetSchemeHandler
+                              forURLScheme:@"views"];
+        [configuration setURLSchemeHandler:assetSchemeHandler
+                              forURLScheme:@"appdata"];
+      }
 
       // create WKWebView, or take over the popup WebKit already created with
       // the opener's configuration
@@ -3630,6 +3744,7 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
       navigationDelegate.spellCheckConfigured =
           self.pendingSpellCheckConfigured;
       navigationDelegate.spellCheckEnabled = self.pendingSpellCheckEnabled;
+      navigationDelegate.isolatedPreviewScheme = isolatedPreviewScheme;
       self.webView.navigationDelegate = navigationDelegate;
       objc_setAssociatedObject(self.webView, "NavigationDelegate",
                                navigationDelegate,
@@ -3638,6 +3753,7 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
       MyWebViewUIDelegate *uiDelegate = [[MyWebViewUIDelegate alloc] init];
       uiDelegate.zigEventHandler = webviewEventHandler;
       uiDelegate.webviewId = webviewId;
+      uiDelegate.isolatedPreview = isolatedPreviewScheme != nil;
       self.webView.UIDelegate = uiDelegate;
       objc_setAssociatedObject(self.webView, "UIDelegate", uiDelegate,
                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -3679,7 +3795,7 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
 
       // hostBridge/bunBridge aliases and internalBridge - RPC bridges (only for
       // non-sandboxed webviews)
-      if (!sandbox) {
+      if (!sandboxed) {
         // hostBridge/bunBridge - user RPC bridge
         MyScriptMessageHandler *bunHandler =
             [[MyScriptMessageHandler alloc] init];
@@ -3709,6 +3825,16 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
         objc_setAssociatedObject(self.webView, "webviewTagHandler",
                                  webviewTagHandler,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      }
+
+      if (isolatedPreviewScheme) {
+        __weak WKWebViewImpl *weakSelf = self;
+        electrobun::loadIsolatedPreviewContentRuleList(
+            isolatedPreviewScheme, ^(WKContentRuleList *ruleList, NSError *error) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf finishIsolatedPreviewSetup:ruleList error:error];
+              });
+            });
       }
 
       // add subview
@@ -3861,6 +3987,45 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
   });
 }
 
+- (void)finishIsolatedPreviewSetup:(WKContentRuleList *)ruleList
+                             error:(NSError *)error {
+  if (!self.webView) {
+    return;
+  }
+  if (!ruleList) {
+    // Fail closed: without the rules the view keeps refusing every load.
+    NSLog(@"ERROR: isolated preview content rules failed for webview %u: %@",
+          self.webviewId, error);
+    return;
+  }
+  [self.webView.configuration.userContentController
+      addContentRuleList:ruleList];
+  self.isolatedPreviewReady = YES;
+  MyNavigationDelegate *navigationDelegate =
+      (MyNavigationDelegate *)objc_getAssociatedObject(self.webView,
+                                                       "NavigationDelegate");
+  navigationDelegate.isolatedPreviewReady = YES;
+
+  NSString *pendingURL = self.pendingIsolatedPreviewURL;
+  self.pendingIsolatedPreviewURL = nil;
+  if (pendingURL) {
+    [self loadURLOnMainThread:pendingURL];
+  }
+}
+
+- (BOOL)respondToIsolatedPreviewRequest:(uint32_t)requestId
+                                 status:(NSInteger)status
+                                headers:(NSDictionary *)headers
+                                   body:(NSData *)body {
+  if (!self.isolatedPreviewSchemeHandler) {
+    return NO;
+  }
+  return [self.isolatedPreviewSchemeHandler respondToRequest:requestId
+                                                      status:status
+                                                     headers:headers
+                                                        body:body];
+}
+
 - (void)loadURLOnMainThread:(NSString *)urlString {
   if (!self.webView) {
     NSLog(@"ERROR: WKWebView loadURL called but webview is nil for webview "
@@ -3874,6 +4039,20 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
     NSLog(@"ERROR: WKWebView loadURL invalid URL for webview ID: %u",
           self.webviewId);
     return;
+  }
+  if (self.isolatedPreviewScheme) {
+    // Refused here as well as in the navigation delegate: loadFileURL would
+    // hand the web process a sandbox extension before any policy runs.
+    if (!electrobun::isolatedPreviewAllowsNavigation(
+            url, self.isolatedPreviewScheme)) {
+      NSLog(@"ERROR: isolated preview webview %u refused to load %@",
+            self.webviewId, urlString);
+      return;
+    }
+    if (!self.isolatedPreviewReady) {
+      self.pendingIsolatedPreviewURL = urlString;
+      return;
+    }
   }
   if (url.isFileURL) {
     NSURL *readAccessURL = [url URLByDeletingLastPathComponent];
@@ -3897,6 +4076,13 @@ static BOOL isPasswordAuthenticationMethod(NSString *method) {
     if (!self.webView) {
       NSLog(@"ERROR: WKWebView loadHTML called but webview is nil for webview "
             @"ID: %u",
+            self.webviewId);
+      return;
+    }
+
+    if (self.isolatedPreviewScheme) {
+      NSLog(@"ERROR: isolated preview webview %u only loads its own scheme; "
+            @"refusing loadHTML",
             self.webviewId);
       return;
     }
@@ -8982,6 +9168,7 @@ static struct {
 } g_nextWebviewAllowedProtocols = {true, false};
 
 static uint32_t g_nextWebviewPopupRequestId = 0;
+static NSString *g_nextWebviewIsolatedPreviewScheme = nil;
 
 extern "C" void setNextWebviewFlags(bool startTransparent,
                                     bool startPassthrough) {
@@ -8997,6 +9184,63 @@ extern "C" void setNextWebviewAllowedProtocols(bool allowViews,
 
 extern "C" void setNextWebviewPopupRequest(uint32_t requestId) {
   g_nextWebviewPopupRequestId = requestId;
+}
+
+extern "C" bool isolatedPreviewSupported() { return true; }
+
+// An empty or invalid scheme clears any pending request and returns false.
+extern "C" bool setNextWebviewIsolatedPreview(const char *scheme) {
+  NSString *schemeString =
+      scheme ? [NSString stringWithUTF8String:scheme] : nil;
+  if (!electrobun::isValidIsolatedPreviewScheme(schemeString)) {
+    g_nextWebviewIsolatedPreviewScheme = nil;
+    return false;
+  }
+  g_nextWebviewIsolatedPreviewScheme = [schemeString copy];
+  return true;
+}
+
+extern "C" bool webviewIsolatedPreviewRespond(AbstractView *abstractView,
+                                              uint32_t requestId,
+                                              uint32_t status,
+                                              const char *headersJson,
+                                              const uint8_t *body,
+                                              size_t bodyLength) {
+  if (!abstractView || !abstractView.isolatedPreviewScheme) {
+    return false;
+  }
+
+  // The caller's buffers may be freed as soon as this returns.
+  NSData *bodyData = (body && bodyLength > 0)
+                         ? [NSData dataWithBytes:body length:bodyLength]
+                         : [NSData data];
+  NSDictionary *headers = @{};
+  if (headersJson && strlen(headersJson) > 0) {
+    NSData *headersData = [NSData dataWithBytes:headersJson
+                                         length:strlen(headersJson)];
+    id parsed = [NSJSONSerialization JSONObjectWithData:headersData
+                                                options:0
+                                                  error:nil];
+    if ([parsed isKindOfClass:[NSDictionary class]]) {
+      NSMutableDictionary *stringHeaders = [NSMutableDictionary dictionary];
+      [(NSDictionary *)parsed
+          enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+            if ([key isKindOfClass:[NSString class]] &&
+                [value isKindOfClass:[NSString class]]) {
+              stringHeaders[key] = value;
+            }
+          }];
+      headers = stringHeaders;
+    }
+  }
+
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [abstractView respondToIsolatedPreviewRequest:requestId
+                                           status:status
+                                          headers:headers
+                                             body:bodyData];
+  });
+  return true;
 }
 
 extern "C" AbstractView *initWebview(
@@ -9019,6 +9263,17 @@ extern "C" AbstractView *initWebview(
   g_nextWebviewAllowedProtocols = {true, false};
   uint32_t popupRequestId = g_nextWebviewPopupRequestId;
   g_nextWebviewPopupRequestId = 0;
+  NSString *isolatedPreviewScheme = g_nextWebviewIsolatedPreviewScheme;
+  g_nextWebviewIsolatedPreviewScheme = nil;
+
+  // An unsandboxed preload carries the RPC secret, and CEF has none of the
+  // WebKit fences, so neither may host an isolated preview.
+  if (isolatedPreviewScheme && (!sandbox || strcmp(renderer, "native") != 0)) {
+    NSLog(@"ERROR initWebview: isolated preview webview %u requires the "
+          @"sandboxed native renderer",
+          webviewId);
+    return nil;
+  }
 
   // Validate frame values - use defaults if NaN or invalid
   if (isnan(x) || isinf(x)) {
@@ -9079,6 +9334,7 @@ extern "C" AbstractView *initWebview(
     created.pendingStartTransparent = startTransparent;
     created.pendingStartPassthrough = startPassthrough;
     created.pendingPopupRequestId = popupRequestId;
+    created.isolatedPreviewScheme = isolatedPreviewScheme;
 
     return (__bridge void *)created;
   });
